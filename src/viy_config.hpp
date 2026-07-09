@@ -23,6 +23,10 @@ struct ViyConfig
   bool     make_code     = true;    // auto_make_code/plan_ea on discovered code targets
   bool     want_drefs    = true;    // record data references (needs a recording backend)
   bool     want_static   = true;    // run the rax static-decode cross-check pass (rax >= 1.2)
+  // Enrichment pass (uses rax's concrete values; all additive, heavily guarded):
+  bool     want_ptr_refs = true;    // materialize in-image pointers loaded from memory (offset + dref)
+  bool     want_data_types = true;  // type undefined globals by observed access size
+  bool     want_comments = true;    // repeatable comments naming what rax resolved
 };
 
 // Load config from environment overrides on top of the defaults above.

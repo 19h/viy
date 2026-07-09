@@ -66,7 +66,7 @@ void code_tr(rax_engine *, uint64_t addr, uint32_t size, void *user)
   c->last_pc = addr;
 }
 
-void mem_tr(rax_engine *, int kind, uint64_t addr, uint32_t size, uint64_t, void *user)
+void mem_tr(rax_engine *, int kind, uint64_t addr, uint32_t size, uint64_t value, void *user)
 {
   HookCtx *c = static_cast<HookCtx *>(user);
   if ( kind == RAX_MEM_FETCH )
@@ -79,7 +79,7 @@ void mem_tr(rax_engine *, int kind, uint64_t addr, uint32_t size, uint64_t, void
     && c->last_pc >= c->flo && c->last_pc < c->fhi
     && c->out->data.size() < c->data_cap )
   {
-    c->out->data.push_back(DataAcc{ c->last_pc, addr, size, kind });
+    c->out->data.push_back(DataAcc{ c->last_pc, addr, value, size, kind });
   }
 }
 

@@ -29,11 +29,14 @@ struct ExecEdge
 };
 
 // A data memory access observed during emulation, attributed to the executing
-// instruction `from`. `kind` is RAX_MEM_READ / RAX_MEM_WRITE.
+// instruction `from`. `kind` is RAX_MEM_READ / RAX_MEM_WRITE. `value` is the
+// datum read/written (low 8 bytes, little-endian) — a loaded value that is
+// itself an in-image address reveals a pointer (vtable slot, function pointer).
 struct DataAcc
 {
   uint64_t from = 0;
   uint64_t addr = 0;
+  uint64_t value = 0;
   uint32_t size = 0;
   int      kind = 0;
 };

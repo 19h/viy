@@ -23,6 +23,7 @@
 #include "emu_driver.hpp"
 #include "ref_discovery.hpp"
 #include "static_decoder.hpp"
+#include "enrich.hpp"
 
 using namespace viy;
 
@@ -50,6 +51,7 @@ struct viy_t : public plugmod_t
   size_t funcs_done = 0;
   RefStats stats;          // from the emulation (indirect) pass
   RefStats sstats;         // from the static-decode (direct) pass
+  EnrichStats estats;      // from the value-derived enrichment pass
   bool started = false;
 
   viy_t();
@@ -150,6 +152,7 @@ void viy_t::on_analysis_done()
   funcs_done = 0;
   stats = RefStats{};
   sstats = RefStats{};
+  estats = EnrichStats{};
   start_sweep();
 }
 
@@ -184,6 +187,13 @@ bool viy_t::process_batch(int count)
     stats.drefs += s.drefs;
     stats.code_made += s.code_made;
 
+    // Enrichment: turn the concrete values observed during emulation into typed
+    // pointers, typed globals, and resolved-target comments.
+    EnrichStats en = viy_enrich(ev, cfg);
+    estats.ptr_refs += en.ptr_refs;
+    estats.typed    += en.typed;
+    estats.comments += en.comments;
+
     // Static pass: rax's decoder recovers any DIRECT targets IDA missed.
     if ( cfg.want_static )
       viy_static_decode_func(api, img.arch, img.big_endian, fstart, fend, cfg, sstats);
@@ -199,13 +209,17 @@ void viy_t::finish()
   const unsigned long long ind_c = (unsigned long long)stats.crefs;   // indirect (emulated)
   const unsigned long long dir_c = (unsigned long long)sstats.crefs;  // direct (static decode)
   const unsigned long long drefs = (unsigned long long)stats.drefs;
-  if ( ind_c != 0 || dir_c != 0 || drefs != 0 )
+  const unsigned long long ptrs  = (unsigned long long)estats.ptr_refs;
+  const unsigned long long typed = (unsigned long long)estats.typed;
+  const unsigned long long cmts  = (unsigned long long)estats.comments;
+  if ( ind_c != 0 || dir_c != 0 || drefs != 0 || ptrs != 0 || typed != 0 || cmts != 0 )
   {
     const char *rv = (api != nullptr && api->version_string != nullptr)
                    ? api->version_string() : "?";
-    msg("viy: recovered %llu code xref(s) [%llu indirect, %llu direct] and "
-        "%llu data xref(s) the analysis missed across %llu function(s) [rax %s]\n",
-        ind_c + dir_c, ind_c, dir_c, drefs,
+    msg("viy: %llu code xref(s) [%llu indirect, %llu direct], %llu data xref(s), "
+        "%llu pointer(s), %llu typed global(s), %llu comment(s) "
+        "across %llu function(s) [rax %s]\n",
+        ind_c + dir_c, ind_c, dir_c, drefs, ptrs, typed, cmts,
         (unsigned long long)funcs_done, rv);
   }
   // Found nothing => say nothing.

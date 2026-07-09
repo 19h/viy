@@ -60,6 +60,7 @@ ida_add_plugin(viy
     src/emu_driver.cpp
     src/ref_discovery.cpp
     src/static_decoder.cpp
+    src/enrich.cpp
   INCLUDES
     "${RAX_CAPI_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/src"

@@ -8,10 +8,15 @@ complementary passes run per function:
   computed data accesses a static disassembler cannot — indirect calls/jumps,
   jump-table targets, vtable/computed calls;
 - a **static (decode)** pass that uses rax's comprehensive x86 and ARM decoder to
-  recover the *direct* branch/call targets IDA's own decode left unlinked.
+  recover the *direct* branch/call targets IDA's own decode left unlinked;
+- an **enrichment** pass that turns the *concrete values* an emulation run knows
+  (which static analysis cannot recover) into IDA annotations: in-image pointers
+  loaded from memory become typed `offset` data (surfacing vtables and
+  function-pointer tables), undefined globals get a data type matching the
+  observed access size, and resolved indirect targets get repeatable comments.
 
-Everything it finds is checked against the existing database and only the
-genuinely missing references are added.
+Everything it finds is checked against the existing database and only genuinely
+missing/undefined items are added — viy only ever *adds*, never overwrites.
 
 It is designed to be **as transparent and invisible as possible**:
 
@@ -108,6 +113,9 @@ All optional; sensible defaults otherwise. Set these before launching IDA.
 | `VIY_MAKE_CODE`      | `1`      | Turn discovered code targets into code.            |
 | `VIY_WANT_DREFS`     | `1`      | Record data references (needs a recording backend).|
 | `VIY_STATIC`         | `1`      | Run the rax static-decode pass (needs rax ≥ 1.2).  |
+| `VIY_PTR_REFS`       | `1`      | Materialize in-image pointers loaded from memory.  |
+| `VIY_TYPE_DATA`      | `1`      | Type undefined globals by observed access size.    |
+| `VIY_COMMENTS`       | `1`      | Add comments naming what rax resolved.             |
 | `VIY_RAX_PATH`       | —        | Explicit path to librax.                           |
 
 ## Scope & limitations

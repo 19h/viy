@@ -50,6 +50,9 @@ ViyConfig viy_load_config()
   c.make_code   = env_bool("VIY_MAKE_CODE", c.make_code);
   c.want_drefs  = env_bool("VIY_WANT_DREFS", c.want_drefs);
   c.want_static = env_bool("VIY_STATIC", c.want_static);
+  c.want_ptr_refs   = env_bool("VIY_PTR_REFS", c.want_ptr_refs);
+  c.want_data_types = env_bool("VIY_TYPE_DATA", c.want_data_types);
+  c.want_comments   = env_bool("VIY_COMMENTS", c.want_comments);
 
   if ( c.funcs_per_tick < 1 )
     c.funcs_per_tick = 1;

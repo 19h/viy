@@ -988,7 +988,8 @@ bool EvidenceStore::deserialize(const std::vector<uint8_t> &blob,
   FactDigest expected = sha256_bytes(envelope);
   uint8_t difference = 0;
   for (size_t i = 0; i != kDigestSize; ++i)
-    difference |= expected.bytes[i] ^ blob[blob.size() - kDigestSize + i];
+    difference |= static_cast<uint8_t>(
+      expected.bytes[i] ^ blob[blob.size() - kDigestSize + i]);
   if (difference != 0)
     return fail(error, "evidence-store SHA-256 integrity check failed");
 

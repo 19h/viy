@@ -207,7 +207,7 @@ void check_seed_corpus()
   constexpr uint64_t image = 0x100000;
   constexpr uint64_t stack = 0x70000000;
   constexpr uint64_t stack_size = 0x100000;
-  for ( uint64_t seed : { 0ull, 1ull, 17ull,
+  for ( uint64_t seed : { UINT64_C(0), UINT64_C(1), UINT64_C(17),
                           std::numeric_limits<uint64_t>::max() } )
   {
     const std::vector<ViySeedValue> first =

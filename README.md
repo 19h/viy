@@ -93,10 +93,9 @@ librax is `dlopen`'d at runtime.
 ## Installing / deploying librax
 
 ```sh
-export IDABIN=/path/to/ida        # your IDA install dir
-make install                      # viy.* AND librax.* -> $IDABIN/plugins
-# or:
-make install-ida-folder           # viy.* -> $IDABIN/plugins ; librax.* -> $IDABIN (the IDA folder)
+make install                      # viy.* AND librax.* -> ~/.idapro/plugins (the user IDA dir)
+# honors $IDAUSR; override the target with PLUGIN_DIR=/path, or:
+make install-app IDABIN=/path/to/ida   # into the IDA *install* dir instead
 ```
 
 librax is found at runtime, in this order:

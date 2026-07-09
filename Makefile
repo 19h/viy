@@ -37,7 +37,17 @@ endif
 
 IDA_CMAKE_FLAG := $(if $(IDA_CMAKE_DIR),-DIDA_CMAKE_DIR=$(IDA_CMAKE_DIR),)
 
-.PHONY: all build rax viy configure install install-ida-folder submodules clean distclean help
+# Per-user IDA directory — where user plugins live (no write access to the IDA
+# install needed, survives IDA upgrades). Honors $IDAUSR (first of its ':'-list),
+# else the platform default (~/.idapro on macOS/Linux). Override with PLUGIN_DIR.
+ifeq ($(strip $(IDAUSR)),)
+IDA_USER_DIR := $(HOME)/.idapro
+else
+IDA_USER_DIR := $(firstword $(subst :, ,$(IDAUSR)))
+endif
+PLUGIN_DIR ?= $(IDA_USER_DIR)/plugins
+
+.PHONY: all build rax viy configure install install-app submodules clean distclean help
 
 all: build
 
@@ -65,21 +75,21 @@ viy: configure
 	cmake --build "$(BUILD_DIR)" --parallel
 	@echo "staged $(BUILD_DIR)/$(VIY_LIB)"
 
-## install: deploy the plugin AND librax into $IDABIN/plugins (librax next to viy)
+## install: deploy the plugin AND librax into the user IDA plugins dir
+## (~/.idapro/plugins by default; librax sits next to viy so it is found).
 install: build
+	mkdir -p "$(PLUGIN_DIR)"
+	cp "$(BUILD_DIR)/$(VIY_LIB)" "$(PLUGIN_DIR)/$(VIY_LIB)"
+	cp "$(BUILD_DIR)/$(RAX_LIB)" "$(PLUGIN_DIR)/$(RAX_LIB)"
+	@echo "installed $(VIY_LIB) + $(RAX_LIB) -> $(PLUGIN_DIR)"
+
+## install-app: deploy into the IDA *install* dir instead ($IDABIN/plugins)
+install-app: build
 	@test -n "$(IDABIN)" || { echo "error: set IDABIN=/path/to/ida"; exit 1; }
 	mkdir -p "$(IDABIN)/plugins"
 	cp "$(BUILD_DIR)/$(VIY_LIB)" "$(IDABIN)/plugins/$(VIY_LIB)"
 	cp "$(BUILD_DIR)/$(RAX_LIB)" "$(IDABIN)/plugins/$(RAX_LIB)"
 	@echo "installed $(VIY_LIB) + $(RAX_LIB) -> $(IDABIN)/plugins"
-
-## install-ida-folder: deploy viy into plugins/ but librax into the IDA folder
-install-ida-folder: build
-	@test -n "$(IDABIN)" || { echo "error: set IDABIN=/path/to/ida"; exit 1; }
-	mkdir -p "$(IDABIN)/plugins"
-	cp "$(BUILD_DIR)/$(VIY_LIB)" "$(IDABIN)/plugins/$(VIY_LIB)"
-	cp "$(BUILD_DIR)/$(RAX_LIB)" "$(IDABIN)/$(RAX_LIB)"
-	@echo "installed $(VIY_LIB) -> $(IDABIN)/plugins ; $(RAX_LIB) -> $(IDABIN)"
 
 ## clean: remove the build directory
 clean:
@@ -94,9 +104,9 @@ help:
 	@echo "  make               build librax + viy into ./$(BUILD_DIR)"
 	@echo "  make rax           build + stage librax only"
 	@echo "  make viy           build + stage the plugin only"
-	@echo "  make install       deploy viy + librax into \$$IDABIN/plugins"
-	@echo "  make install-ida-folder  deploy viy into plugins/, librax into the IDA folder"
+	@echo "  make install       deploy viy + librax into $(PLUGIN_DIR)"
+	@echo "  make install-app   deploy into the IDA install dir (\$$IDABIN/plugins)"
 	@echo "  make clean         remove ./$(BUILD_DIR)"
 	@echo ""
-	@echo "Env: IDASDK (required to build the plugin), IDABIN (for install),"
-	@echo "     IDA_CMAKE_DIR, BUILD_DIR (default build), DEBUG=1"
+	@echo "Env: IDASDK (required to build), IDAUSR or PLUGIN_DIR (install location),"
+	@echo "     IDABIN (for install-app), IDA_CMAKE_DIR, BUILD_DIR (default build), DEBUG=1"

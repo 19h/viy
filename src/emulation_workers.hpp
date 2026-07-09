@@ -1,0 +1,178 @@
+/*
+ * emulation_workers.hpp -- deterministic, IDA-free emulation scheduling.
+ *
+ * Jobs crossing this boundary contain only copied viy model/configuration data.
+ * Worker executors are constructed inside their worker thread, which lets each
+ * rax-backed executor own an entirely independent engine.  Results are exposed
+ * strictly in submission order even when execution completes out of order.
+ */
+#pragma once
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "emu_driver.hpp"
+#include "program_model.hpp"
+#include "viy_config.hpp"
+
+namespace viy {
+
+struct EmulationRunRequest
+{
+  uint64_t seed = 0;
+  uint32_t run_id = 0;
+  bool record_pcs = true;
+  bool has_input = false;
+  EmuInput input;
+};
+
+// A complete, immutable unit of worker-side work. The main thread must build
+// call-site inputs before submission; no worker implementation may query IDA.
+struct EmulationJob
+{
+  FuncRange function;
+  ViyConfig config;
+  std::vector<EmulationRunRequest> runs;
+};
+
+struct EmulationRunResult
+{
+  uint64_t seed = 0;
+  uint32_t run_id = 0;
+  bool ran = false;
+  EmuEvents events;
+  EmuOutcome outcome;
+};
+
+enum class EmulationJobStatus : uint8_t
+{
+  COMPLETED = 0,
+  CANCELLED,
+  UNAVAILABLE,
+  FAILED,
+};
+
+struct EmulationJobResult
+{
+  uint64_t ticket = 0; // assigned by EmulationWorkerPool
+  uint64_t function_start = 0;
+  EmulationJobStatus status = EmulationJobStatus::FAILED;
+  std::string diagnostic;
+  std::vector<EmulationRunResult> runs;
+  EmuEvents merged;
+
+  bool completed() const { return status == EmulationJobStatus::COMPLETED; }
+};
+
+// A generation-bound cancellation view. It remains valid until the executor
+// returns. Cancellation is cooperative between bounded emulate_from() calls;
+// an in-flight rax call is allowed to reach its instruction/time limit.
+class EmulationCancellation
+{
+public:
+  EmulationCancellation() = default;
+  bool cancelled() const noexcept;
+
+private:
+  friend class EmulationWorkerPool;
+  EmulationCancellation(std::shared_ptr<const void> state, uint64_t generation);
+
+  std::shared_ptr<const void> state_;
+  uint64_t generation_ = 0;
+};
+
+// One instance is created inside each worker. Implementations must be
+// thread-confined: the pool never calls an executor from another thread.
+class EmulationExecutor
+{
+public:
+  virtual ~EmulationExecutor() = default;
+  virtual bool available() const noexcept = 0;
+  virtual std::string unavailable_reason() const = 0;
+  virtual EmulationJobResult execute(const EmulationJob &job,
+                                     const EmulationCancellation &cancel) = 0;
+};
+
+using EmulationExecutorFactory =
+    std::function<std::unique_ptr<EmulationExecutor>(size_t worker_index)>;
+
+struct EmulationWorkerStats
+{
+  size_t requested_workers = 0;
+  size_t initialized_workers = 0;
+  size_t available_workers = 0;
+  size_t unavailable_workers = 0;
+  uint64_t submitted = 0;
+  uint64_t settled = 0;
+  uint64_t delivered = 0;
+  size_t queued = 0;
+  size_t running = 0;
+  size_t ready_in_order_or_later = 0;
+  bool stopping = false;
+};
+
+// Resolve VIY_WORKERS. Explicit positive values are respected up to hard_cap;
+// zero selects one fewer than the machine's hardware concurrency (but at least
+// one) and caps the automatic choice at four. Each engine owns a full mapped
+// image plus a baseline snapshot, so an unbounded CPU-count default would cause
+// severe memory amplification on large IDBs.
+size_t viy_resolve_worker_count(int configured, size_t hard_cap = 64);
+
+// Stable semantic identity used by the epoch cache. It covers function bytes
+// and chunks, the complete visible image identity, run/input corpus, relevant
+// configuration, and call-summary set. It deliberately ignores object layout
+// and padding.
+uint64_t viy_emulation_job_fingerprint(
+    const EmulationJob &job,
+    uint64_t image_content_hash,
+    const std::vector<EmuCallSummary> &call_summaries);
+
+class EmulationWorkerPool
+{
+public:
+  // max_queued_jobs==0 means no explicit queue limit. A bounded value makes
+  // try_submit() provide backpressure without ever blocking IDA's main thread.
+  EmulationWorkerPool(size_t worker_count, EmulationExecutorFactory factory,
+                      size_t max_queued_jobs = 0);
+  ~EmulationWorkerPool();
+
+  EmulationWorkerPool(const EmulationWorkerPool &) = delete;
+  EmulationWorkerPool &operator=(const EmulationWorkerPool &) = delete;
+
+  // Returns false only after shutdown or while a bounded queue is full.
+  // `ticket` is monotonically increasing and is assigned only on success.
+  bool try_submit(EmulationJob job, uint64_t *ticket = nullptr);
+
+  // Results are delivered in ticket order. Later completed results remain
+  // buffered until every earlier ticket has settled.
+  bool try_take_next(EmulationJobResult &out);
+  bool wait_take_next(EmulationJobResult &out, std::chrono::milliseconds timeout);
+  std::vector<EmulationJobResult> take_ready(size_t maximum = 0);
+
+  // Cancels queued and running jobs from the current generation. Partial run
+  // evidence from a running job is retained in its CANCELLED result. Jobs may
+  // be submitted again after cancellation; they belong to the new generation.
+  void cancel_pending();
+
+  // Cooperative, idempotent shutdown. Queued jobs settle as CANCELLED and
+  // workers join after their current bounded emulation call returns.
+  void shutdown();
+
+  bool wait_for_initialization(std::chrono::milliseconds timeout) const;
+  bool wait_until_idle(std::chrono::milliseconds timeout) const;
+  bool initialized() const;
+  bool usable() const;
+  bool idle() const;
+  EmulationWorkerStats stats() const;
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+} // namespace viy

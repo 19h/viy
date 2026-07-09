@@ -159,6 +159,13 @@ bool resolve(void *h, RaxApi *out)
   VIY_RAX_FUNCS(X)
 #undef X
 
+  // Resolve capability additions independently.  None of these is required to
+  // preserve the original emulation contract; consumers feature-test fields.
+#define X(field, sym) \
+  out->field = reinterpret_cast<decltype(&sym)>(dlsym(h, #sym));
+  VIY_RAX_OPTIONAL_FUNCS(X)
+#undef X
+
   // ABI gate: MAJOR must match exactly; MINOR must cover the EMULATION surface
   // viy requires (introduced in rax 1.1). The static decoder arrived in 1.2 and
   // is resolved separately below as OPTIONAL, so viy still runs (emulation only)
@@ -180,6 +187,10 @@ bool resolve(void *h, RaxApi *out)
   // Optional: the static decoder (rax >= 1.2). If absent, out->decode stays null
   // and viy simply skips its static-decode pass.
   out->decode = reinterpret_cast<decltype(&rax_decode)>(dlsym(h, "rax_decode"));
+
+  // Optional: stateless, fixed-layout SMIR effect analysis (rax >= 1.3).
+  // Resolve independently so a 1.2 decoder remains useful.
+  out->analyze = reinterpret_cast<decltype(&rax_analyze)>(dlsym(h, "rax_analyze"));
 
   return true;
 }

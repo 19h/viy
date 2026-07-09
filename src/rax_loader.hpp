@@ -13,8 +13,6 @@
  * "transparent and invisible": IDA always loads the plugin; when librax is not
  * present the plugin simply does nothing.
  *
- * Pattern mirrors kvasir's librax_loader (see
- * /Users/int/hexrays/kvasir/include/kvasir/emulation/rax/librax_loader.hpp).
  */
 #pragma once
 
@@ -55,17 +53,56 @@ namespace viy {
   X(context_save,             rax_context_save)              \
   X(context_restore,          rax_context_restore)
 
+// Optional capabilities.  These are deliberately kept out of the mandatory
+// surface above: an older, ABI-compatible librax must remain usable for the
+// core discovery pass.  New analyses probe the corresponding field before use
+// and degrade independently when a capability is absent.
+#define VIY_RAX_OPTIONAL_FUNCS(X)                            \
+  /* lifecycle/introspection */                              \
+  X(engine_reset,             rax_engine_reset)              \
+  X(engine_arch,              rax_engine_arch)               \
+  X(engine_mode,              rax_engine_mode)               \
+  /* complete memory inspection */                           \
+  X(mem_unmap,               rax_mem_unmap)                  \
+  X(mem_read,                rax_mem_read)                   \
+  X(mem_write_virt,          rax_mem_write_virt)             \
+  X(mem_read_virt,           rax_mem_read_virt)              \
+  X(mem_translate,           rax_mem_translate)              \
+  X(mem_regions,             rax_mem_regions)                \
+  /* complete register access */                             \
+  X(reg_size,                rax_reg_size)                   \
+  X(reg_read,                rax_reg_read)                   \
+  X(reg_write,               rax_reg_write)                  \
+  /* granular execution */                                   \
+  X(emu_step,                rax_emu_step)                   \
+  X(interrupt,               rax_interrupt)                  \
+  X(nmi,                     rax_nmi)                        \
+  X(can_interrupt,           rax_can_interrupt)              \
+  /* richer hooks for environment models and coverage */     \
+  X(hook_add_block,          rax_hook_add_block)             \
+  X(hook_add_intr,           rax_hook_add_intr)              \
+  X(hook_add_io_in,          rax_hook_add_io_in)             \
+  X(hook_add_io_out,         rax_hook_add_io_out)            \
+  X(hook_add_mmio_read,      rax_hook_add_mmio_read)         \
+  X(hook_add_mmio_write,     rax_hook_add_mmio_write)
+
 // Resolved rax_* entry points. Every field is valid iff rax_load() != nullptr.
 struct RaxApi
 {
 #define X(field, sym) decltype(&sym) field = nullptr;
   VIY_RAX_FUNCS(X)
+  VIY_RAX_OPTIONAL_FUNCS(X)
 #undef X
 
   // Optional (rax API >= 1.2): the static instruction decoder. May be null with
   // an older librax that only provides the emulation surface — callers must
   // check `decode != nullptr` (see rax_can_decode) and degrade gracefully.
   decltype(&rax_decode) decode = nullptr;
+
+  // Optional (rax API >= 1.3): stateless SMIR instruction-effect analysis.
+  // The result is entirely caller-owned fixed-layout data; no Rust pointer
+  // crosses this boundary. Older 1.x libraries remain fully usable.
+  decltype(&rax_analyze) analyze = nullptr;
 };
 
 // Load librax exactly once for the process (thread-safe), caching the outcome.
@@ -82,6 +119,14 @@ inline bool rax_can_decode()
 {
   const RaxApi *a = rax_load();
   return a != nullptr && a->decode != nullptr;
+}
+
+// True iff the loaded librax additionally exposes the versioned stateless
+// instruction-effect analyzer (rax >= 1.3).
+inline bool rax_can_analyze()
+{
+  const RaxApi *a = rax_load();
+  return a != nullptr && a->analyze != nullptr;
 }
 
 // Precise reason emulation is unavailable (empty when available). For an

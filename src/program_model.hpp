@@ -16,8 +16,8 @@
 
 namespace viy {
 
-// Architectures viy can drive through rax. Others => ViyArch::UNSUPPORTED and
-// the sweep silently does nothing.
+// Architectures the program model can identify. Individual decoder/emulator
+// backends capability-gate this list independently; others are UNSUPPORTED.
 enum class ViyArch
 {
   UNSUPPORTED = 0,
@@ -26,6 +26,19 @@ enum class ViyArch
   X86_64,
   ARM64,
   ARM32,
+  RISCV64,
+  CORTEX_M,
+  HEXAGON,
+};
+
+// Portable mirrors of IDA's SEGPERM_* bits. Keeping the values here lets the
+// IDA-free emulation/analysis side ask permission questions without including
+// an SDK header.
+enum class ViySegPerm : uint32_t
+{
+  EXEC  = 1u,
+  WRITE = 2u,
+  READ  = 4u,
 };
 
 // One mapped segment's bytes plus an initialized-byte bitmap (1 bit per byte;
@@ -39,14 +52,49 @@ struct SegImage
   uint8_t  bitness = 0; // 0=16,1=32,2=64
   std::vector<uint8_t> bytes; // size == end-start
   std::vector<uint8_t> mask;  // size == (end-start+7)/8, 1 bit per byte
+
+  bool contains(uint64_t ea) const;
+  bool byte_loaded(uint64_t ea) const;
+  bool has_perm(ViySegPerm required) const;
 };
 
-// A function's entry and end, so emulation can restrict recorded refs to sources
-// inside the function body (its contiguous primary chunk).
+// A half-open function chunk [start,end). The first chunk in FuncRange::chunks
+// is the entry chunk; subsequent chunks are IDA function tails.
+struct FuncChunk
+{
+  uint64_t start = 0;
+  uint64_t end   = 0;
+
+  bool contains(uint64_t ea) const { return ea >= start && ea < end; }
+  uint64_t size() const { return end > start ? end - start : 0; }
+};
+
+// Version of viy_function_byte_hash(). Persisted consumers should store this
+// beside a hash so a future algorithm change cannot be mistaken for new bytes.
+constexpr uint32_t VIY_FUNCTION_HASH_VERSION = 1;
+
+// A function entry plus every chunk that IDA assigns to it. `start` and `end`
+// deliberately retain their old meanings (entry and end of the PRIMARY chunk)
+// so existing callers remain source- and behavior-compatible. New code should
+// use contains()/chunks when it needs the complete function.
 struct FuncRange
 {
   uint64_t start = 0;
   uint64_t end   = 0;
+  std::vector<FuncChunk> chunks;
+
+  // Deterministic hash of chunk topology, initialized-byte state, and bytes.
+  // The hash is rebase-stable: chunk locations are represented relative to the
+  // function entry. See viy_function_byte_hash().
+  uint64_t byte_hash = 0;
+
+  // ProgramImage generation in which the current byte_hash was first observed.
+  // Re-snapshotting unchanged bytes preserves this value; a content/topology
+  // change advances it to the new ProgramImage::generation.
+  uint64_t generation = 0;
+
+  bool contains(uint64_t ea) const;
+  uint64_t byte_size() const;
 };
 
 struct ProgramImage
@@ -58,11 +106,42 @@ struct ProgramImage
   std::vector<SegImage>  segs;
   std::vector<FuncRange> entries; // functions to emulate
 
+  // Rebase-stable identity of segment topology, permissions, initialized-byte
+  // state and bytes. Used to invalidate cached emulation when code or any
+  // concrete global data visible to a function changes.
+  uint64_t content_hash = 0;
+
+  // Monotonic snapshot generation (within this ProgramImage instance).
+  uint64_t generation = 0;
+
+  const SegImage *segment_at(uint64_t ea) const;
+  bool contains(uint64_t ea) const { return segment_at(ea) != nullptr; }
   bool byte_loaded(uint64_t ea) const;
+  bool has_perm(uint64_t ea, ViySegPerm required, bool allow_unknown = false) const;
+  bool executable(uint64_t ea, bool allow_unknown = false) const
+  {
+    return has_perm(ea, ViySegPerm::EXEC, allow_unknown);
+  }
+  bool writable(uint64_t ea, bool allow_unknown = false) const
+  {
+    return has_perm(ea, ViySegPerm::WRITE, allow_unknown);
+  }
+  bool readable(uint64_t ea, bool allow_unknown = false) const
+  {
+    return has_perm(ea, ViySegPerm::READ, allow_unknown);
+  }
+
+  const FuncRange *function_at(uint64_t ea) const;
 };
 
+// Stable, IDA-independent identity for a function's current bytes in `img`.
+// It includes every chunk, holes/uninitialized bytes, and relative chunk
+// topology, but not absolute addresses (so rebasing does not change the hash).
+uint64_t viy_function_byte_hash(const ProgramImage &img, const FuncRange &func);
+uint64_t viy_program_content_hash(const ProgramImage &img);
+
 // Detect the target architecture/endianness from the open database. Returns
-// false (out set to UNSUPPORTED) for anything viy does not drive.
+// false (out set to UNSUPPORTED) for anything viy cannot identify safely.
 bool viy_detect_arch(ViyArch &arch_out, bool &big_endian_out);
 
 // Snapshot segments + function entries into `img`. Main thread only.

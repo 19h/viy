@@ -120,8 +120,15 @@ RefStats viy_apply_missing(const EmuEvents &ev, const ViyConfig &cfg)
   }
 
   // ---- data references (computed loads/stores) ----------------------------
+  // Memory hooks may still be active when drefs are disabled because runtime
+  // strings and SMC correlation consume transient writes. The IDB switch must
+  // nevertheless be an absolute gate on computed add_dref mutations.
+  if ( !cfg.want_drefs )
+    return st;
   for ( const DataAcc &d : ev.data )
   {
+    if ( d.scope != DataScope::IMAGE )
+      continue;
     const ea_t from = (ea_t)d.from;
     const ea_t to   = (ea_t)d.addr;
 

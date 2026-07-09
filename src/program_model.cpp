@@ -13,21 +13,55 @@
 #include <segment.hpp>
 #include <funcs.hpp>
 
+#include <algorithm>
+#include <limits>
+#include <unordered_map>
+
 namespace viy {
 
-bool ProgramImage::byte_loaded(uint64_t ea) const
+static_assert(static_cast<uint32_t>(ViySegPerm::EXEC) == SEGPERM_EXEC,
+              "ViySegPerm must mirror IDA SEGPERM_EXEC");
+static_assert(static_cast<uint32_t>(ViySegPerm::WRITE) == SEGPERM_WRITE,
+              "ViySegPerm must mirror IDA SEGPERM_WRITE");
+static_assert(static_cast<uint32_t>(ViySegPerm::READ) == SEGPERM_READ,
+              "ViySegPerm must mirror IDA SEGPERM_READ");
+
+namespace {
+
+bool procname_is(const qstring &name, const char *candidate)
 {
-  for ( const SegImage &s : segs )
-  {
-    if ( ea < s.start || ea >= s.end )
-      continue;
-    uint64_t off = ea - s.start;
-    if ( off / 8 >= s.mask.size() )
-      return false;
-    return (s.mask[off / 8] & (1u << (off & 7))) != 0;
-  }
+  return strieq(name.c_str(), candidate);
+}
+
+bool sdk_cortex_m_id(int id)
+{
+#if defined(PLFM_CORTEXM)
+  if ( id == PLFM_CORTEXM )
+    return true;
+#endif
+#if defined(PLFM_CORTEX_M)
+  if ( id == PLFM_CORTEX_M )
+    return true;
+#endif
+  (void)id;
   return false;
 }
+
+bool sdk_hexagon_id(int id)
+{
+#if defined(PLFM_QDSP6)
+  if ( id == PLFM_QDSP6 )
+    return true;
+#endif
+#if defined(PLFM_HEXAGON)
+  if ( id == PLFM_HEXAGON )
+    return true;
+#endif
+  (void)id;
+  return false;
+}
+
+} // namespace
 
 bool viy_detect_arch(ViyArch &arch_out, bool &big_endian_out)
 {
@@ -37,6 +71,27 @@ bool viy_detect_arch(ViyArch &arch_out, bool &big_endian_out)
   const int id = PH.id;
   const uint bits = inf_get_app_bitness(); // 16 / 32 / 64
   const bool is64 = inf_is_64bit();
+
+  // Some SDKs expose these as dedicated processor ids. IDA 9.3's bundled
+  // Hexagon has the stable short name QDSP6 when no public processor constant
+  // is available; recognize that name without embedding a numeric value. Cortex-M
+  // normally shares PLFM_ARM today, so only a dedicated id/name is treated as
+  // CORTEX_M -- generic all-Thumb ARM firmware is not sufficient proof.
+  const qstring procname = inf_get_procname();
+  if ( sdk_cortex_m_id(id)
+    || procname_is(procname, "Cortex-M")
+    || procname_is(procname, "CortexM") )
+  {
+    arch_out = ViyArch::CORTEX_M;
+    return true;
+  }
+  if ( sdk_hexagon_id(id)
+    || procname_is(procname, "QDSP6")
+    || procname_is(procname, "Hexagon") )
+  {
+    arch_out = ViyArch::HEXAGON;
+    return true;
+  }
 
   switch ( id )
   {
@@ -48,6 +103,12 @@ bool viy_detect_arch(ViyArch &arch_out, bool &big_endian_out)
     case PLFM_ARM:
       arch_out = is64 ? ViyArch::ARM64 : ViyArch::ARM32;
       break;
+#if defined(PLFM_RISCV)
+    case PLFM_RISCV:
+      // The companion rax C ABI currently exposes RV64, not RV32.
+      arch_out = bits == 64 ? ViyArch::RISCV64 : ViyArch::UNSUPPORTED;
+      break;
+#endif
     default:
       arch_out = ViyArch::UNSUPPORTED;
       break;
@@ -57,10 +118,21 @@ bool viy_detect_arch(ViyArch &arch_out, bool &big_endian_out)
 
 void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
 {
-  // Idempotent: reset so a repeated call (e.g. a later reanalysis pass) does not
-  // accumulate duplicate segment buffers or entries.
+  // Keep prior content generations so an incremental caller can distinguish an
+  // unchanged function from one whose bytes or chunk topology changed.
+  struct PriorIdentity { uint64_t hash = 0, generation = 0; };
+  std::unordered_map<uint64_t, PriorIdentity> prior;
+  prior.reserve(img.entries.size());
+  for ( const FuncRange &func : img.entries )
+    prior[func.start] = PriorIdentity{ func.byte_hash, func.generation };
+
+  if ( img.generation != std::numeric_limits<uint64_t>::max() )
+    ++img.generation;
+
+  // Reset so a repeated call does not accumulate duplicate buffers or entries.
   img.segs.clear();
   img.entries.clear();
+  img.content_hash = 0;
   img.lo = img.hi = 0;
 
   viy_detect_arch(img.arch, img.big_endian);
@@ -104,6 +176,9 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
     }
     img.segs.push_back(std::move(si));
   }
+  std::sort(img.segs.begin(), img.segs.end(),
+            [](const SegImage &a, const SegImage &b) { return a.start < b.start; });
+  img.content_hash = viy_program_content_hash(img);
 
   // ---- function entries ---------------------------------------------------
   const size_t nfuncs = get_func_qty();
@@ -120,8 +195,37 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
     // emulating them adds noise, not missed refs.
     if ( (pfn->flags & (FUNC_LIB | FUNC_THUNK)) != 0 )
       continue;
-    img.entries.push_back(FuncRange{ (uint64_t)pfn->start_ea, (uint64_t)pfn->end_ea });
+    FuncRange func;
+    func.start = (uint64_t)pfn->start_ea;
+    func.end   = (uint64_t)pfn->end_ea; // compatibility: primary chunk end
+
+    func_tail_iterator_t chunks(pfn);
+    for ( bool ok = chunks.main(); ok; ok = chunks.next() )
+    {
+      const range_t &chunk = chunks.chunk();
+      if ( chunk.end_ea > chunk.start_ea )
+        func.chunks.push_back(FuncChunk{ (uint64_t)chunk.start_ea, (uint64_t)chunk.end_ea });
+    }
+    // A valid function always has its entry chunk, but retain a defensive
+    // fallback so downstream complete-function membership never becomes empty.
+    if ( func.chunks.empty() && func.end > func.start )
+      func.chunks.push_back(FuncChunk{ func.start, func.end });
+
+    func.byte_hash = viy_function_byte_hash(img, func);
+    const auto old = prior.find(func.start);
+    if ( old != prior.end() && old->second.hash == func.byte_hash
+      && old->second.generation != 0 )
+    {
+      func.generation = old->second.generation;
+    }
+    else
+    {
+      func.generation = img.generation;
+    }
+    img.entries.push_back(std::move(func));
   }
+  std::sort(img.entries.begin(), img.entries.end(),
+            [](const FuncRange &a, const FuncRange &b) { return a.start < b.start; });
 }
 
 } // namespace viy

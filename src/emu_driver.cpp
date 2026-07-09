@@ -17,7 +17,11 @@
 #include "emu_driver.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <limits>
+#include <map>
+#include <tuple>
 
 namespace viy {
 
@@ -28,61 +32,613 @@ constexpr uint64_t kStackSize = 0x100000;           // 1 MiB scratch stack
 constexpr uint64_t kMaxCtx    = 512ull * 1024 * 1024; // cap snapshot buffer size
 
 inline uint64_t page_down(uint64_t x) { return x & ~(kPage - 1); }
-inline uint64_t page_up(uint64_t x)   { return (x + kPage - 1) & ~(kPage - 1); }
+
+bool checked_add(uint64_t left, uint64_t right, uint64_t *out)
+{
+  if ( out == nullptr || left > std::numeric_limits<uint64_t>::max() - right )
+    return false;
+  *out = left + right;
+  return true;
+}
+
+bool contains_range(uint64_t lo, uint64_t hi, uint64_t address, uint64_t size)
+{
+  uint64_t end = 0;
+  return size != 0 && hi >= lo && address >= lo && checked_add(address, size, &end)
+      && end <= hi;
+}
 
 // The stable context handed to every hook via the rax `user` pointer.
 struct HookCtx
 {
   EmuEvents *out = nullptr;
+  const RaxApi *api = nullptr;
+  const std::vector<int> *capture_regs = nullptr;
+  const std::vector<EmuCallSummary> *summaries = nullptr;
+  const ProgramImage *image = nullptr;
   uint64_t   lo = 0, hi = 0;      // image bounds; targets outside are ignored
   uint64_t   flo = 0, fhi = 0;    // current function bounds; only in-function sources are trusted
+  const FuncRange *func = nullptr; // complete chunk topology when available
+  uint64_t   stack_lo = 0, stack_hi = 0;
+  uint64_t   heap_lo = 0, heap_cursor = 0, heap_hi = 0;
   uint64_t   prev_pc = 0, last_pc = 0;
+  uint64_t   summary_source = 0;
   uint32_t   prev_size = 0;
+  uint32_t   run_id = 0;
+  uint64_t   seed = 0;
+  uint64_t   sequence = 0;
+  int        sp_reg = -1, lr_reg = -1, pc_reg = -1, ret_reg = -1;
+  const std::vector<int> *arg_regs = nullptr;
+  bool       is64 = false, big_endian = false;
+  uint32_t   stack_argument_offset = 0;
+  int        rax_arch = 0;
+  uint32_t   rax_mode = 0;
+  uint8_t    register_width = 8;
+  bool       strict_permissions = false;
+  bool       record_memory = false;
+  bool       permission_violation = false;
+  bool       terminated_process = false;
+  bool       summary_resume = false;
+  uint32_t   summarized_calls = 0;
   bool       has_prev = false;
   bool       record_pcs = false; // populate out->exec_pcs (opaque-predicate analysis)
-  size_t     edge_cap = 0, data_cap = 0;
+  size_t     edge_cap = 0, execution_cap = 0, data_cap = 0, state_cap = 0;
 };
 
-void code_tr(rax_engine *, uint64_t addr, uint32_t size, void *user)
+bool hook_in_function(const HookCtx *c, uint64_t ea)
+{
+  return c->func != nullptr ? c->func->contains(ea) : (ea >= c->flo && ea < c->fhi);
+}
+
+bool image_access_allowed(const HookCtx *c, uint64_t address, uint32_t size,
+                          ViySegPerm required)
+{
+  if ( c->image == nullptr || size == 0 )
+    return true;
+  uint64_t end = 0;
+  if ( !checked_add(address, size, &end) )
+    return false;
+  uint64_t cursor = address;
+  bool touches_image = false;
+  while ( cursor < end )
+  {
+    const SegImage *segment = c->image->segment_at(cursor);
+    if ( segment == nullptr )
+    {
+      // Synthetic stack/heap and wholly external accesses are governed by
+      // their own mappings. A gap inside image bounds remains a backend fault.
+      return !touches_image;
+    }
+    touches_image = true;
+    if ( segment->perm != 0 && !segment->has_perm(required) )
+      return false;
+    cursor = std::min(end, segment->end);
+  }
+  return true;
+}
+
+void restore_snapshot_bytes(HookCtx *c, rax_engine *engine,
+                            uint64_t address, uint32_t size)
+{
+  if ( c->api == nullptr || c->image == nullptr || size == 0
+    || size > (1u << 20) )
+    return;
+  std::vector<uint8_t> bytes(size, 0);
+  for ( uint32_t index = 0; index < size; ++index )
+  {
+    uint64_t current = 0;
+    if ( !checked_add(address, index, &current) )
+      return;
+    const SegImage *segment = c->image->segment_at(current);
+    if ( segment == nullptr )
+      return;
+    const uint64_t raw_offset = current - segment->start;
+    if ( raw_offset >= segment->bytes.size() )
+      continue;
+    const size_t offset = size_t(raw_offset);
+    if ( offset / 8 < segment->mask.size()
+      && (segment->mask[offset / 8] & uint8_t(1u << (offset & 7))) != 0 )
+      bytes[index] = segment->bytes[offset];
+  }
+  c->api->mem_write(engine, address, bytes.data(), bytes.size());
+}
+
+const EmuCallSummary *find_summary(const HookCtx *c, uint64_t address)
+{
+  if ( c->summaries == nullptr )
+    return nullptr;
+  auto it = std::lower_bound(c->summaries->begin(), c->summaries->end(), address,
+    [](const EmuCallSummary &s, uint64_t a) { return s.address < a; });
+  return it != c->summaries->end() && it->address == address ? &*it : nullptr;
+}
+
+bool read_scalar(HookCtx *c, rax_engine *engine, uint64_t address,
+                 size_t size, uint64_t *out)
+{
+  if ( c->api == nullptr || c->api->mem_read == nullptr || size == 0 || size > 8 )
+    return false;
+  uint8_t bytes[8] = { 0 };
+  if ( c->api->mem_read(engine, address, bytes, size) != RAX_OK )
+    return false;
+  uint64_t value = 0;
+  for ( size_t i = 0; i < size; ++i )
+  {
+    const size_t shift_index = c->big_endian ? (size - 1 - i) : i;
+    value |= uint64_t(bytes[i]) << (8 * shift_index);
+  }
+  *out = value;
+  return true;
+}
+
+bool summary_arg(HookCtx *c, rax_engine *engine, size_t index, uint64_t *out)
+{
+  if ( c->arg_regs != nullptr && index < c->arg_regs->size() )
+    return c->api->reg_read_u64(engine, (*c->arg_regs)[index], out) == RAX_OK;
+  if ( c->sp_reg < 0 )
+    return false;
+  uint64_t sp = 0;
+  if ( c->api->reg_read_u64(engine, c->sp_reg, &sp) != RAX_OK )
+    return false;
+  const size_t ptr = c->is64 ? 8 : 4;
+  size_t stack_index = index;
+  if ( c->arg_regs != nullptr )
+    stack_index -= c->arg_regs->size();
+  const uint64_t return_slot = c->lr_reg < 0 ? ptr : 0;
+  const uint64_t home = c->stack_argument_offset;
+  if ( stack_index > std::numeric_limits<uint64_t>::max() / ptr )
+    return false;
+  uint64_t address = 0;
+  return checked_add(sp, return_slot, &address)
+      && checked_add(address, home, &address)
+      && checked_add(address, uint64_t(stack_index) * ptr, &address)
+      && read_scalar(c, engine, address, ptr, out);
+}
+
+DataScope access_scope(const HookCtx *c, uint64_t address, uint32_t size,
+                       bool *recordable)
+{
+  if ( contains_range(c->lo, c->hi, address, size) )
+  {
+    *recordable = true;
+    return DataScope::IMAGE;
+  }
+  if ( contains_range(c->heap_lo, c->heap_hi, address, size) )
+  {
+    *recordable = true;
+    return DataScope::HEAP;
+  }
+  if ( contains_range(c->stack_lo, c->stack_hi, address, size) )
+  {
+    *recordable = true;
+    return DataScope::STACK;
+  }
+  *recordable = false;
+  return DataScope::OTHER;
+}
+
+void record_summary_access(HookCtx *c, int kind, uint64_t address,
+                           uint64_t value, uint32_t size)
+{
+  if ( c->out == nullptr || c->out->data.size() >= c->data_cap )
+    return;
+  bool recordable = false;
+  const DataScope scope = access_scope(c, address, size, &recordable);
+  if ( !recordable || !hook_in_function(c, c->summary_source) )
+    return;
+  DataAcc a;
+  a.from = c->summary_source;
+  a.addr = address;
+  a.value = value;
+  a.size = size;
+  a.kind = kind;
+  a.scope = scope;
+  a.sequence = c->sequence++;
+  a.run_id = c->run_id;
+  a.seed = c->seed;
+  c->out->data.push_back(a);
+}
+
+uint64_t scalar_from_memory(const HookCtx *c, const uint8_t *bytes, size_t size)
+{
+  const size_t n = std::min<size_t>(size, 8);
+  uint64_t value = 0;
+  for ( size_t i = 0; i < n; ++i )
+  {
+    const size_t shift_index = c->big_endian ? (n - 1 - i) : i;
+    value |= uint64_t(bytes[i]) << (8 * shift_index);
+  }
+  return value;
+}
+
+bool read_c_string(HookCtx *c, rax_engine *engine, uint64_t address,
+                   std::vector<uint8_t> &out, size_t limit = 65536)
+{
+  out.clear();
+  if ( c->api->mem_read == nullptr )
+    return false;
+  for ( size_t i = 0; i < limit; ++i )
+  {
+    uint64_t current = 0;
+    if ( !checked_add(address, uint64_t(i), &current) )
+      return false;
+    uint8_t ch = 0;
+    if ( c->api->mem_read(engine, current, &ch, 1) != RAX_OK )
+      return false;
+    out.push_back(ch);
+    if ( ch == 0 )
+      return true;
+  }
+  return false;
+}
+
+bool summary_return(HookCtx *c, rax_engine *engine, uint64_t value)
+{
+  if ( c->ret_reg >= 0 )
+    if ( c->api->reg_write_u64(engine, c->ret_reg, value) != RAX_OK )
+      return false;
+  uint64_t target = 0;
+  if ( c->lr_reg >= 0 )
+  {
+    if ( c->api->reg_read_u64(engine, c->lr_reg, &target) != RAX_OK )
+      return false;
+  }
+  else
+  {
+    uint64_t sp = 0;
+    const size_t ptr = c->is64 ? 8 : 4;
+    if ( c->sp_reg < 0 || c->api->reg_read_u64(engine, c->sp_reg, &sp) != RAX_OK
+      || !read_scalar(c, engine, sp, ptr, &target) )
+      return false;
+    uint64_t next_sp = 0;
+    if ( !checked_add(sp, ptr, &next_sp)
+      || c->api->reg_write_u64(engine, c->sp_reg, next_sp) != RAX_OK )
+      return false;
+  }
+  if ( c->pc_reg < 0 || c->api->reg_write_u64(engine, c->pc_reg, target) != RAX_OK )
+    return false;
+  // Request a clean boundary. EmuDriver resumes from the rewritten PC so the
+  // destination receives its own code hook and the until/count/time budgets
+  // remain under host control; executing it in this same step would skip hooks.
+  c->summary_resume = true;
+  c->api->emu_stop(engine);
+  return true;
+}
+
+bool apply_summary(HookCtx *c, rax_engine *engine, const EmuCallSummary &summary)
+{
+  constexpr uint64_t kMaxModelBytes = 1ull << 20;
+  uint64_t a0 = 0, a1 = 0, a2 = 0, result = 0;
+  auto args = [&](size_t count) -> bool
+  {
+    return (count < 1 || summary_arg(c, engine, 0, &a0))
+        && (count < 2 || summary_arg(c, engine, 1, &a1))
+        && (count < 3 || summary_arg(c, engine, 2, &a2));
+  };
+  std::vector<uint8_t> bytes;
+  switch ( summary.kind )
+  {
+    case EmuSummaryKind::TERMINATE:
+      c->terminated_process = true;
+      ++c->summarized_calls;
+      c->api->emu_stop(engine);
+      return true;
+    case EmuSummaryKind::STRLEN:
+      if ( !args(1) || !read_c_string(c, engine, a0, bytes) )
+        return false;
+      result = bytes.size() - 1;
+      record_summary_access(c, RAX_MEM_READ, a0,
+                            scalar_from_memory(c, bytes.data(), bytes.size()),
+                            uint32_t(bytes.size()));
+      break;
+    case EmuSummaryKind::STRCMP:
+    {
+      std::vector<uint8_t> rhs;
+      if ( !args(2) || !read_c_string(c, engine, a0, bytes)
+        || !read_c_string(c, engine, a1, rhs) )
+        return false;
+      const size_t n = std::min(bytes.size(), rhs.size());
+      int cmp = std::memcmp(bytes.data(), rhs.data(), n);
+      if ( cmp == 0 ) cmp = bytes.size() < rhs.size() ? -1 : bytes.size() > rhs.size() ? 1 : 0;
+      result = uint64_t(int64_t(cmp));
+      record_summary_access(c, RAX_MEM_READ, a0,
+                            scalar_from_memory(c, bytes.data(), bytes.size()),
+                            uint32_t(bytes.size()));
+      record_summary_access(c, RAX_MEM_READ, a1,
+                            scalar_from_memory(c, rhs.data(), rhs.size()),
+                            uint32_t(rhs.size()));
+      break;
+    }
+    case EmuSummaryKind::MEMCPY:
+    case EmuSummaryKind::MEMMOVE:
+    {
+      if ( !args(3) )
+        return false;
+      if ( a2 > kMaxModelBytes )
+        return false;
+      const size_t n = size_t(a2);
+      bytes.resize(n);
+      if ( n != 0 )
+      {
+        if ( c->api->mem_read == nullptr
+          || c->api->mem_read(engine, a1, bytes.data(), n) != RAX_OK
+          || c->api->mem_write(engine, a0, bytes.data(), n) != RAX_OK )
+          return false;
+        const uint64_t value = scalar_from_memory(c, bytes.data(), n);
+        record_summary_access(c, RAX_MEM_READ, a1, value, uint32_t(n));
+        record_summary_access(c, RAX_MEM_WRITE, a0, value, uint32_t(n));
+      }
+      result = a0;
+      break;
+    }
+    case EmuSummaryKind::MEMSET:
+    {
+      if ( !args(3) )
+        return false;
+      if ( a2 > kMaxModelBytes )
+        return false;
+      const size_t n = size_t(a2);
+      bytes.assign(n, uint8_t(a1));
+      if ( n != 0 )
+      {
+        if ( c->api->mem_write(engine, a0, bytes.data(), n) != RAX_OK )
+          return false;
+        record_summary_access(c, RAX_MEM_WRITE, a0,
+                              scalar_from_memory(c, bytes.data(), n), uint32_t(n));
+      }
+      result = a0;
+      break;
+    }
+    case EmuSummaryKind::STRCPY:
+      if ( !args(2) || !read_c_string(c, engine, a1, bytes)
+        || c->api->mem_write(engine, a0, bytes.data(), bytes.size()) != RAX_OK )
+        return false;
+      record_summary_access(c, RAX_MEM_READ, a1,
+                            scalar_from_memory(c, bytes.data(), bytes.size()),
+                            uint32_t(bytes.size()));
+      record_summary_access(c, RAX_MEM_WRITE, a0,
+                            scalar_from_memory(c, bytes.data(), bytes.size()),
+                            uint32_t(bytes.size()));
+      result = a0;
+      break;
+    case EmuSummaryKind::STRNCPY:
+    {
+      if ( !args(3) )
+        return false;
+      if ( a2 > kMaxModelBytes )
+        return false;
+      const size_t n = size_t(a2);
+      bytes.assign(n, 0);
+      size_t read_count = 0;
+      bool terminated = false;
+      for ( size_t i = 0; i < n && !terminated; ++i )
+      {
+        uint64_t source = 0;
+        if ( !checked_add(a1, uint64_t(i), &source) || c->api->mem_read == nullptr
+          || c->api->mem_read(engine, source, &bytes[i], 1) != RAX_OK )
+          return false;
+        ++read_count;
+        terminated = bytes[i] == 0;
+      }
+      if ( n != 0 && c->api->mem_write(engine, a0, bytes.data(), n) != RAX_OK )
+        return false;
+      if ( read_count != 0 )
+        record_summary_access(c, RAX_MEM_READ, a1,
+                              scalar_from_memory(c, bytes.data(), read_count),
+                              uint32_t(read_count));
+      if ( n != 0 )
+        record_summary_access(c, RAX_MEM_WRITE, a0,
+                              scalar_from_memory(c, bytes.data(), n), uint32_t(n));
+      result = a0;
+      break;
+    }
+    case EmuSummaryKind::ALLOCATE:
+    case EmuSummaryKind::CALLOCATE:
+    {
+      if ( !args(summary.kind == EmuSummaryKind::CALLOCATE ? 2 : 1) )
+        return false;
+      uint64_t n = a0;
+      if ( summary.kind == EmuSummaryKind::CALLOCATE )
+      {
+        if ( a0 != 0 && a1 > std::numeric_limits<uint64_t>::max() / a0 )
+          n = 0;
+        else
+          n = a0 * a1;
+      }
+      // An oversized/overflowing request is conservatively modeled as an
+      // allocation failure instead of fabricating a smaller valid object.
+      if ( n > kMaxModelBytes )
+        n = 0;
+      const uint64_t aligned = (n + 15) & ~15ull;
+      if ( n != 0 && c->heap_cursor <= c->heap_hi && aligned <= c->heap_hi - c->heap_cursor )
+      {
+        result = c->heap_cursor;
+        if ( summary.kind == EmuSummaryKind::CALLOCATE )
+        {
+          bytes.assign(size_t(n), 0);
+          if ( c->api->mem_write(engine, result, bytes.data(), bytes.size()) != RAX_OK )
+            return false;
+          record_summary_access(c, RAX_MEM_WRITE, result, 0, uint32_t(n));
+        }
+        c->heap_cursor += aligned;
+      }
+      break;
+    }
+    case EmuSummaryKind::DEALLOCATE:
+      if ( !args(1) )
+        return false;
+      result = 0;
+      break;
+  }
+  if ( !summary_return(c, engine, result) )
+    return false;
+  ++c->summarized_calls;
+  return true;
+}
+
+bool decode_at(const HookCtx *c, uint64_t pc, uint32_t *size,
+               ExecEdge::Kind *kind)
+{
+  if ( size != nullptr )
+    *size = 0;
+  if ( kind != nullptr )
+    *kind = ExecEdge::Kind::Unknown;
+  if ( c->api == nullptr || c->api->decode == nullptr || c->image == nullptr )
+    return false;
+  for ( const SegImage &segment : c->image->segs )
+  {
+    if ( pc < segment.start || pc >= segment.end )
+      continue;
+    const uint64_t raw_offset = pc - segment.start;
+    if ( raw_offset >= segment.bytes.size() )
+      return false;
+    const size_t offset = size_t(raw_offset);
+    const size_t available = std::min<size_t>(15, segment.bytes.size() - offset);
+    size_t loaded = 0;
+    while ( loaded < available )
+    {
+      const size_t bit = offset + loaded;
+      if ( bit / 8 >= segment.mask.size()
+        || (segment.mask[bit / 8] & uint8_t(1u << (bit & 7))) == 0 )
+        break;
+      ++loaded;
+    }
+    if ( loaded == 0 )
+      return false;
+    rax_decoded decoded{};
+    if ( c->api->decode(c->rax_arch, c->rax_mode, pc,
+                        segment.bytes.data() + offset, loaded, &decoded) != RAX_OK
+      || decoded.valid == 0 || decoded.size == 0 )
+      return false;
+    if ( size != nullptr )
+      *size = decoded.size;
+    if ( kind != nullptr )
+    {
+      switch ( decoded.flow )
+      {
+        case RAX_FLOW_CALL:
+        case RAX_FLOW_INDIRECT_CALL: *kind = ExecEdge::Kind::Call; break;
+        case RAX_FLOW_BRANCH:
+        case RAX_FLOW_COND_BRANCH:
+        case RAX_FLOW_INDIRECT_JUMP: *kind = ExecEdge::Kind::Jump; break;
+        case RAX_FLOW_RETURN: *kind = ExecEdge::Kind::Return; break;
+        default: break;
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+void code_tr(rax_engine *engine, uint64_t addr, uint32_t size, void *user)
 {
   HookCtx *c = static_cast<HookCtx *>(user);
+  if ( c->strict_permissions
+    && !image_access_allowed(c, addr, size == 0 ? 1 : size, ViySegPerm::EXEC) )
+  {
+    c->permission_violation = true;
+    c->api->emu_stop(engine);
+    return;
+  }
+  const uint64_t event_sequence = c->sequence++;
   if ( c->has_prev )
   {
-    const uint64_t fallthrough = c->prev_pc + c->prev_size;
+    uint32_t decoded_size = 0;
+    ExecEdge::Kind edge_kind = ExecEdge::Kind::Unknown;
+    decode_at(c, c->prev_pc, &decoded_size, &edge_kind);
+    const uint64_t instruction_size = c->prev_size != 0 ? c->prev_size : decoded_size;
+    uint64_t fallthrough = 0;
+    const bool fallthrough_valid = instruction_size != 0
+                                && checked_add(c->prev_pc, instruction_size, &fallthrough);
     // Record a taken branch only when its SOURCE is inside the function being
     // emulated (prev_pc in [flo,fhi)) and its TARGET is inside the image. This
     // keeps callee bodies (executed under this function's fabricated state) from
     // contributing edges — each function is mined from its own entry.
-    if ( addr != fallthrough
+    if ( (!fallthrough_valid || addr != fallthrough)
       && addr >= c->lo && addr < c->hi
-      && c->prev_pc >= c->flo && c->prev_pc < c->fhi
+      && hook_in_function(c, c->prev_pc)
       && c->out->edges.size() < c->edge_cap )
     {
-      c->out->edges.push_back(ExecEdge{ c->prev_pc, addr });
+      c->out->edges.push_back(ExecEdge{ c->prev_pc, addr, c->run_id,
+                                        c->seed, edge_kind, event_sequence });
+      if ( c->api != nullptr && c->capture_regs != nullptr
+        && c->out->states.size() < c->state_cap )
+      {
+        StatePoint p;
+        p.source = c->prev_pc;
+        p.pc = addr;
+        p.run_id = c->run_id;
+        p.seed = c->seed;
+        p.regs.reserve(c->capture_regs->size());
+        for ( int reg : *c->capture_regs )
+        {
+          uint64_t value = 0;
+          if ( c->api->reg_read_u64(engine, reg, &value) == RAX_OK )
+            p.regs.push_back(RegisterValue{ reg, value, c->register_width });
+        }
+        c->out->states.push_back(std::move(p));
+      }
     }
   }
-  if ( c->record_pcs && c->out->exec_pcs.size() < c->edge_cap )
+  if ( addr >= c->lo && addr < c->hi
+    && c->out->execution.size() < c->execution_cap )
+  {
+    c->out->execution.push_back(ExecPoint{ addr, event_sequence,
+                                           c->run_id, c->seed });
+  }
+  if ( c->record_pcs && hook_in_function(c, addr) && c->out->exec_pcs.size() < c->edge_cap )
     c->out->exec_pcs.insert(addr);
+  c->summary_source = c->has_prev ? c->prev_pc : addr;
+  if ( const EmuCallSummary *summary = find_summary(c, addr); summary != nullptr )
+    apply_summary(c, engine, *summary);
   c->prev_pc = addr;
   c->prev_size = size;
   c->has_prev = true;
   c->last_pc = addr;
 }
 
-void mem_tr(rax_engine *, int kind, uint64_t addr, uint32_t size, uint64_t value, void *user)
+void mem_tr(rax_engine *engine, int kind, uint64_t addr, uint32_t size,
+            uint64_t value, void *user)
 {
   HookCtx *c = static_cast<HookCtx *>(user);
   if ( kind == RAX_MEM_FETCH )
     return; // instruction fetch is control flow, not a data reference
+  const ViySegPerm required = kind == RAX_MEM_WRITE ? ViySegPerm::WRITE
+                                                    : ViySegPerm::READ;
+  if ( c->strict_permissions
+    && !image_access_allowed(c, addr, size, required) )
+  {
+    // Memory hooks are post-retirement in rax. Roll a forbidden image write
+    // back to the immutable snapshot before stopping, so even the ephemeral
+    // guest state obeys the policy and no forbidden evidence is published.
+    if ( kind == RAX_MEM_WRITE )
+      restore_snapshot_bytes(c, engine, addr, size);
+    c->permission_violation = true;
+    c->api->emu_stop(engine);
+    return;
+  }
+  if ( !c->record_memory )
+    return;
   // Attribute to the executing instruction (last_pc, set by the code hook at
   // instruction entry; rax dispatches an access at the boundary of the
   // instruction that made it, before the next instruction's code hook). Only
   // trust accesses whose source is inside the function being emulated.
-  if ( addr >= c->lo && addr < c->hi
-    && c->last_pc >= c->flo && c->last_pc < c->fhi
+  bool recordable = false;
+  const DataScope scope = access_scope(c, addr, size, &recordable);
+  if ( recordable
+    && hook_in_function(c, c->last_pc)
     && c->out->data.size() < c->data_cap )
   {
-    c->out->data.push_back(DataAcc{ c->last_pc, addr, value, size, kind });
+    DataAcc a;
+    a.from = c->last_pc;
+    a.addr = addr;
+    a.value = value;
+    a.size = size;
+    a.kind = kind;
+    a.scope = scope;
+    a.sequence = c->sequence++;
+    a.run_id = c->run_id;
+    a.seed = c->seed;
+    c->out->data.push_back(a);
   }
 }
 
@@ -95,9 +651,10 @@ int inv_tr(rax_engine *, uint64_t, void *)
 // Returns false for architectures viy does not drive.
 bool arch_params(ViyArch a, bool big_endian,
                  int &rax_arch, uint32_t &mode,
-                 int &sp_reg, int &fp_reg, int &lr_reg, bool &is64)
+                 int &sp_reg, int &fp_reg, int &lr_reg,
+                 int &pc_reg, int &ret_reg, bool &is64)
 {
-  sp_reg = fp_reg = lr_reg = -1;
+  sp_reg = fp_reg = lr_reg = pc_reg = ret_reg = -1;
   switch ( a )
   {
     // X86_16 (segmented real mode) is intentionally not driven: linear IDA
@@ -105,18 +662,37 @@ bool arch_params(ViyArch a, bool big_endian,
     // falls through to `return false`, so the sweep is a clean no-op there.
     case ViyArch::X86_32:
       rax_arch = RAX_ARCH_X86; mode = RAX_MODE_32;
-      sp_reg = RAX_X86_REG_RSP; fp_reg = RAX_X86_REG_RBP; is64 = false; return true;
+      sp_reg = RAX_X86_REG_ESP; fp_reg = RAX_X86_REG_EBP;
+      pc_reg = RAX_X86_REG_EIP; ret_reg = RAX_X86_REG_EAX; is64 = false; return true;
     case ViyArch::X86_64:
       rax_arch = RAX_ARCH_X86; mode = RAX_MODE_64;
-      sp_reg = RAX_X86_REG_RSP; fp_reg = RAX_X86_REG_RBP; is64 = true; return true;
+      sp_reg = RAX_X86_REG_RSP; fp_reg = RAX_X86_REG_RBP;
+      pc_reg = RAX_X86_REG_RIP; ret_reg = RAX_X86_REG_RAX; is64 = true; return true;
     case ViyArch::ARM64:
       rax_arch = RAX_ARCH_ARM64;
       mode = big_endian ? RAX_MODE_BIG_ENDIAN : RAX_MODE_LITTLE_ENDIAN;
-      sp_reg = RAX_ARM64_REG_SP; lr_reg = RAX_ARM64_X(30); is64 = true; return true;
+      sp_reg = RAX_ARM64_REG_SP; lr_reg = RAX_ARM64_X(30);
+      pc_reg = RAX_ARM64_REG_PC; ret_reg = RAX_ARM64_X(0); is64 = true; return true;
     case ViyArch::ARM32:
       rax_arch = RAX_ARCH_ARM;
       mode = RAX_MODE_ARM | (big_endian ? RAX_MODE_BIG_ENDIAN : RAX_MODE_LITTLE_ENDIAN);
-      sp_reg = RAX_ARM_REG_SP; lr_reg = RAX_REG_LR; is64 = false; return true;
+      sp_reg = RAX_ARM_REG_SP; lr_reg = RAX_REG_LR;
+      pc_reg = RAX_ARM_REG_PC; ret_reg = RAX_ARM_R(0); is64 = false; return true;
+    case ViyArch::RISCV64:
+      rax_arch = RAX_ARCH_RISCV64;
+      mode = big_endian ? RAX_MODE_BIG_ENDIAN : RAX_MODE_LITTLE_ENDIAN;
+      sp_reg = RAX_RISCV_X(2); fp_reg = RAX_RISCV_X(8); lr_reg = RAX_RISCV_X(1);
+      pc_reg = RAX_RISCV_REG_PC; ret_reg = RAX_RISCV_X(10); is64 = true; return true;
+    case ViyArch::CORTEX_M:
+      rax_arch = RAX_ARCH_CORTEXM;
+      mode = RAX_MODE_THUMB | (big_endian ? RAX_MODE_BIG_ENDIAN : RAX_MODE_LITTLE_ENDIAN);
+      sp_reg = RAX_REG_SP; lr_reg = RAX_CM_REG_LR;
+      pc_reg = RAX_CM_REG_PC; ret_reg = RAX_CM_R(0); is64 = false; return true;
+    case ViyArch::HEXAGON:
+      rax_arch = RAX_ARCH_HEXAGON;
+      mode = big_endian ? RAX_MODE_BIG_ENDIAN : RAX_MODE_LITTLE_ENDIAN;
+      sp_reg = RAX_HEX_R(29); fp_reg = RAX_HEX_R(30); lr_reg = RAX_HEX_R(31);
+      pc_reg = RAX_HEX_REG_PC; ret_reg = RAX_HEX_R(0); is64 = false; return true;
     default:
       return false;
   }
@@ -124,32 +700,160 @@ bool arch_params(ViyArch a, bool big_endian,
 
 } // namespace
 
-EmuDriver::EmuDriver(const RaxApi *api, const ProgramImage &img)
-  : api_(api), img_(img)
+void EmuEvents::merge_from(const EmuEvents &other)
 {
-  int rax_arch = 0, sp = -1, fp = -1, lr = -1;
+  if ( this == &other )
+  {
+    const EmuEvents copy(other);
+    merge_from(copy);
+    return;
+  }
+  edges.insert(edges.end(), other.edges.begin(), other.edges.end());
+  execution.insert(execution.end(), other.execution.begin(), other.execution.end());
+  data.insert(data.end(), other.data.begin(), other.data.end());
+  states.insert(states.end(), other.states.begin(), other.states.end());
+  final_writes.insert(final_writes.end(), other.final_writes.begin(), other.final_writes.end());
+  exec_pcs.insert(other.exec_pcs.begin(), other.exec_pcs.end());
+}
+
+void EmuEvents::normalize()
+{
+  std::sort(edges.begin(), edges.end(), [](const ExecEdge &a, const ExecEdge &b)
+  {
+    return std::tie(a.run_id, a.seed, a.sequence, a.from, a.to, a.kind)
+         < std::tie(b.run_id, b.seed, b.sequence, b.from, b.to, b.kind);
+  });
+  edges.erase(std::unique(edges.begin(), edges.end(), [](const ExecEdge &a, const ExecEdge &b)
+  {
+    return a.run_id == b.run_id && a.seed == b.seed && a.sequence == b.sequence
+        && a.from == b.from && a.to == b.to && a.kind == b.kind;
+  }), edges.end());
+
+  std::sort(execution.begin(), execution.end(), [](const ExecPoint &a,
+                                                    const ExecPoint &b)
+  {
+    return std::tie(a.run_id, a.seed, a.sequence, a.pc)
+         < std::tie(b.run_id, b.seed, b.sequence, b.pc);
+  });
+  execution.erase(std::unique(execution.begin(), execution.end(),
+    [](const ExecPoint &a, const ExecPoint &b)
+    {
+      return a.run_id == b.run_id && a.seed == b.seed
+          && a.sequence == b.sequence && a.pc == b.pc;
+    }), execution.end());
+
+  // Memory accesses are ordered evidence.  Preserve repeated accesses but put
+  // merged runs into a deterministic run/sequence order.
+  std::sort(data.begin(), data.end(), [](const DataAcc &a, const DataAcc &b)
+  {
+    return std::tie(a.run_id, a.seed, a.sequence, a.from, a.addr, a.kind,
+                    a.size, a.value, a.scope)
+         < std::tie(b.run_id, b.seed, b.sequence, b.from, b.addr, b.kind,
+                    b.size, b.value, b.scope);
+  });
+  data.erase(std::unique(data.begin(), data.end(), [](const DataAcc &a, const DataAcc &b)
+  {
+    return a.run_id == b.run_id && a.seed == b.seed && a.sequence == b.sequence
+        && a.from == b.from && a.addr == b.addr && a.kind == b.kind
+        && a.size == b.size && a.value == b.value && a.scope == b.scope;
+  }), data.end());
+
+  for ( StatePoint &state : states )
+  {
+    std::sort(state.regs.begin(), state.regs.end(), [](const RegisterValue &a,
+                                                       const RegisterValue &b)
+    {
+      return std::tie(a.reg, a.width, a.value) < std::tie(b.reg, b.width, b.value);
+    });
+    state.regs.erase(std::unique(state.regs.begin(), state.regs.end(),
+      [](const RegisterValue &a, const RegisterValue &b)
+      { return a.reg == b.reg && a.width == b.width && a.value == b.value; }),
+      state.regs.end());
+  }
+
+  auto regs_less = [](const std::vector<RegisterValue> &a,
+                      const std::vector<RegisterValue> &b)
+  {
+    return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end(),
+      [](const RegisterValue &x, const RegisterValue &y)
+      { return std::tie(x.reg, x.value, x.width) < std::tie(y.reg, y.value, y.width); });
+  };
+  std::sort(states.begin(), states.end(), [&](const StatePoint &a, const StatePoint &b)
+  {
+    const auto ak = std::tie(a.run_id, a.source, a.pc, a.seed);
+    const auto bk = std::tie(b.run_id, b.source, b.pc, b.seed);
+    if ( ak != bk )
+      return ak < bk;
+    return regs_less(a.regs, b.regs);
+  });
+  states.erase(std::unique(states.begin(), states.end(), [](const StatePoint &a, const StatePoint &b)
+  {
+    if ( a.run_id != b.run_id || a.source != b.source || a.pc != b.pc || a.seed != b.seed
+      || a.regs.size() != b.regs.size() )
+      return false;
+    for ( size_t i = 0; i < a.regs.size(); ++i )
+      if ( a.regs[i].reg != b.regs[i].reg || a.regs[i].value != b.regs[i].value
+        || a.regs[i].width != b.regs[i].width )
+        return false;
+    return true;
+  }), states.end());
+
+  std::sort(final_writes.begin(), final_writes.end(), [](const MemoryBytes &a, const MemoryBytes &b)
+  {
+    return std::tie(a.run_id, a.seed, a.addr, a.scope, a.bytes)
+         < std::tie(b.run_id, b.seed, b.addr, b.scope, b.bytes);
+  });
+  final_writes.erase(std::unique(final_writes.begin(), final_writes.end(),
+    [](const MemoryBytes &a, const MemoryBytes &b)
+    {
+      return a.run_id == b.run_id && a.addr == b.addr && a.seed == b.seed
+          && a.scope == b.scope && a.bytes == b.bytes;
+    }), final_writes.end());
+}
+
+EmuDriver::EmuDriver(const RaxApi *api, const ProgramImage &img, bool strict_perms,
+                     bool windows_x64, const std::vector<EmuCallSummary> &summaries)
+  : api_(api), img_(img), strict_perms_(strict_perms), windows_x64_(windows_x64),
+    summaries_(summaries)
+{
+  if ( api_ == nullptr )
+    return;
+  int rax_arch = 0, sp = -1, fp = -1, lr = -1, pc = -1, ret = -1;
   uint32_t mode = 0;
   bool is64 = false;
-  if ( !arch_params(img_.arch, img_.big_endian, rax_arch, mode, sp, fp, lr, is64) )
+  if ( !arch_params(img_.arch, img_.big_endian, rax_arch, mode,
+                    sp, fp, lr, pc, ret, is64) )
     return;
-  sp_reg_ = sp; fp_reg_ = fp; lr_reg_ = lr;
-
-  // Integer argument registers, for multi-run seed variation (opaque-predicate
-  // analysis). Empty where args are stack-passed (x86-32) or the arch isn't
-  // driven for discovery.
-  switch ( img_.arch )
+  sp_reg_ = sp; fp_reg_ = fp; lr_reg_ = lr; pc_reg_ = pc; ret_reg_ = ret;
+  rax_arch_ = rax_arch;
+  rax_mode_ = mode;
+  abi_ = viy_abi_for_arch(img_.arch, windows_x64_);
+  const ViyAbiLayout &abi_layout = viy_abi_layout(abi_);
+  if ( !abi_layout.supported() )
+    return;
+  std::sort(summaries_.begin(), summaries_.end(), [](const EmuCallSummary &a,
+                                                     const EmuCallSummary &b)
   {
-    case ViyArch::X86_64:
-      arg_regs_ = { RAX_X86_REG_RDI, RAX_X86_REG_RSI, RAX_X86_REG_RDX,
-                    RAX_X86_REG_RCX, RAX_X86_REG_R8,  RAX_X86_REG_R9 };
-      break;
-    case ViyArch::ARM64:
-      for ( int i = 0; i < 8; ++i )
-        arg_regs_.push_back(RAX_ARM64_X(i));
-      break;
-    default:
-      break;
-  }
+    return std::tie(a.address, a.kind) < std::tie(b.address, b.kind);
+  });
+  summaries_.erase(std::unique(summaries_.begin(), summaries_.end(),
+    [](const EmuCallSummary &a, const EmuCallSummary &b)
+    { return a.address == b.address; }), summaries_.end());
+
+  // Integer argument registers are selected by the same IDA-free ABI policy
+  // used by call-site input collection and stack placement.
+  arg_regs_ = abi_layout.argument_registers;
+  capture_regs_ = arg_regs_;
+  auto add_capture = [&](int reg)
+  {
+    if ( reg >= 0 && std::find(capture_regs_.begin(), capture_regs_.end(), reg) == capture_regs_.end() )
+      capture_regs_.push_back(reg);
+  };
+  add_capture(sp_reg_);
+  add_capture(fp_reg_);
+  add_capture(lr_reg_);
+  add_capture(pc_reg_);
+  add_capture(ret_reg_);
 
   // Choose a scratch stack region that does not intersect the image. This region
   // doubles as the engine's initial (default) mapping, so it never collides with
@@ -201,7 +905,12 @@ EmuDriver::EmuDriver(const RaxApi *api, const ProgramImage &img)
     engine_ = nullptr;
     return;
   }
-  map_stack();
+  if ( !map_stack() )
+  {
+    api_->engine_close(engine_);
+    engine_ = nullptr;
+    return;
+  }
 
   // Probe whether the backend records per-access memory (x86-64 today). If not,
   // drefs are simply skipped; crefs still work wherever code hooks fire.
@@ -224,51 +933,77 @@ EmuDriver::~EmuDriver()
 
 bool EmuDriver::map_image()
 {
-  // Merge segments into page-aligned intervals so adjacent/overlapping segments
-  // do not cause overlapping mem_map calls.
-  struct IV { uint64_t base, end; };
-  std::vector<IV> ivs;
-  ivs.reserve(img_.segs.size());
+  // Build page permissions first. IDA and rax use different permission bit
+  // layouts; pages shared by adjacent segments receive the union. In permissive
+  // compatibility mode every page remains RWX, but the evidence records which
+  // mode produced a run at the caller level.
+  std::map<uint64_t, uint32_t> pages;
   for ( const SegImage &s : img_.segs )
   {
     if ( s.end <= s.start )
       continue;
-    ivs.push_back(IV{ page_down(s.start), page_up(s.end) });
-  }
-  std::sort(ivs.begin(), ivs.end(), [](const IV &a, const IV &b) { return a.base < b.base; });
-
-  std::vector<IV> merged;
-  for ( const IV &iv : ivs )
-  {
-    if ( !merged.empty() && iv.base <= merged.back().end )
+    uint32_t prot = RAX_PROT_NONE;
+    if ( !strict_perms_ || s.perm == 0 )
+      prot = RAX_PROT_ALL;
+    else
     {
-      if ( iv.end > merged.back().end )
-        merged.back().end = iv.end;
+      if ( (s.perm & 4u) != 0 ) prot |= RAX_PROT_READ;  // SEGPERM_READ
+      if ( (s.perm & 2u) != 0 ) prot |= RAX_PROT_WRITE; // SEGPERM_WRITE
+      if ( (s.perm & 1u) != 0 ) prot |= RAX_PROT_EXEC;  // SEGPERM_EXEC
+    }
+    uint64_t rounded_end = s.end;
+    if ( (s.end & (kPage - 1)) != 0 )
+    {
+      uint64_t rounded = 0;
+      if ( !checked_add(s.end, kPage - 1, &rounded) )
+        return false;
+      rounded_end = page_down(rounded);
+    }
+    for ( uint64_t p = page_down(s.start); p < rounded_end; )
+    {
+      pages[p] |= prot;
+      if ( rounded_end - p <= kPage )
+        break;
+      p += kPage;
+    }
+  }
+
+  struct IV { uint64_t base, end; uint32_t prot; };
+  std::vector<IV> merged;
+  for ( const auto &kv : pages )
+  {
+    const uint64_t base = kv.first;
+    const uint32_t prot = kv.second == RAX_PROT_NONE ? RAX_PROT_READ : kv.second;
+    if ( !merged.empty() && base == merged.back().end && prot == merged.back().prot )
+    {
+      merged.back().end += kPage;
     }
     else
     {
-      merged.push_back(iv);
+      uint64_t end = 0;
+      if ( !checked_add(base, kPage, &end) )
+        return false;
+      merged.push_back(IV{ base, end, prot });
     }
   }
 
   for ( const IV &iv : merged )
   {
     const uint64_t len = iv.end - iv.base;
-    int st = api_->mem_map(engine_, iv.base, len, RAX_PROT_ALL);
+    int st = api_->mem_map(engine_, iv.base, len, iv.prot);
     if ( st != RAX_OK )
     {
-      // Possibly already mapped (e.g. the default stack region if a candidate
-      // overlapped): make sure it is at least accessible, otherwise give up.
-      if ( api_->mem_protect(engine_, iv.base, len, RAX_PROT_ALL) != RAX_OK )
+      // Possibly already mapped. The selected scratch range is guaranteed not
+      // to overlap the image, so protecting this exact interval is safe.
+      if ( api_->mem_protect(engine_, iv.base, len, iv.prot) != RAX_OK )
         return false;
     }
   }
 
-  load_image_bytes();
-  return true;
+  return load_image_bytes();
 }
 
-void EmuDriver::load_image_bytes()
+bool EmuDriver::load_image_bytes()
 {
   // Write each segment's initialized bytes; leave holes (.bss) as zero-fill.
   // Used once at map time; per-run restoration is done via the context snapshot
@@ -276,6 +1011,9 @@ void EmuDriver::load_image_bytes()
   for ( const SegImage &s : img_.segs )
   {
     const size_t len = s.bytes.size();
+    if ( s.end < s.start || uint64_t(len) > s.end - s.start
+      || (len != 0 && s.mask.size() < (len + 7) / 8) )
+      return false;
     size_t i = 0;
     while ( i < len )
     {
@@ -286,17 +1024,23 @@ void EmuDriver::load_image_bytes()
       size_t j = i;
       while ( j < len && (s.mask[j / 8] & (1u << (j & 7))) != 0 )
         ++j;
-      api_->mem_write(engine_, s.start + i, s.bytes.data() + i, j - i);
+      uint64_t address = 0;
+      if ( !checked_add(s.start, uint64_t(i), &address)
+        || api_->mem_write(engine_, address, s.bytes.data() + i, j - i) != RAX_OK )
+        return false;
       i = j;
     }
   }
+  return true;
 }
 
 bool EmuDriver::map_stack()
 {
   // The stack is the engine's default region (mem_base/mem_size at open); just
-  // make sure it is fully accessible.
-  return api_->mem_protect(engine_, stack_base_, stack_size_, RAX_PROT_ALL) == RAX_OK;
+  // make sure it is data-accessible. The sentinel is an `until` address and is
+  // never fetched, so an executable stack is unnecessary in strict mode.
+  const uint32_t prot = strict_perms_ ? (RAX_PROT_READ | RAX_PROT_WRITE) : RAX_PROT_ALL;
+  return api_->mem_protect(engine_, stack_base_, stack_size_, prot) == RAX_OK;
 }
 
 void EmuDriver::save_baseline()
@@ -326,37 +1070,118 @@ void EmuDriver::save_baseline()
   baseline_ok_ = true;
 }
 
-void EmuDriver::seed_arg_regs(uint64_t seed)
+bool EmuDriver::seed_arg_regs(uint64_t seed)
 {
-  // Write small, varied scalar values into the integer argument registers so
-  // repeated runs take different conditional-branch directions. Kept small to
-  // vary comparisons without immediately faulting on a wild pointer deref.
-  uint64_t x = seed * 0x9E3779B97F4A7C15ull + 0x1234567u;
-  for ( int r : arg_regs_ )
+  // A deterministic corpus mixes scalar boundaries with addresses that are
+  // actually mapped. This explores pointer guards without turning every
+  // non-zero input into an immediate fault.
+  const std::vector<ViySeedValue> corpus = viy_seed_argument_corpus(
+      seed, arg_regs_.size(), img_.lo, stack_base_, stack_size_);
+  for ( size_t index = 0; index < arg_regs_.size(); ++index )
   {
-    x ^= x >> 33; x *= 0xFF51AFD7ED558CCDull; x ^= x >> 33;
-    api_->reg_write_u64(engine_, r, x & 0xFFFFu);
+    if ( api_->reg_write_u64(engine_, arg_regs_[index], corpus[index].value) != RAX_OK )
+      return false;
+  }
+  return true;
+}
+
+bool EmuDriver::apply_input(const EmuInput &input, uint64_t sp)
+{
+  const ViyAbiInputPlan plan = viy_plan_abi_input(
+      viy_abi_layout(abi_), input, sp, stack_base_, stack_size_, img_.big_endian);
+  if ( !plan.valid() )
+    return false;
+  for ( const ViyAbiRegisterWrite &write : plan.registers )
+    if ( api_->reg_write_u64(engine_, write.reg, write.value) != RAX_OK )
+      return false;
+  for ( const ViyAbiStackWrite &write : plan.stack )
+    if ( api_->mem_write(engine_, write.address, write.bytes.data(), write.size) != RAX_OK )
+      return false;
+  return true;
+}
+
+void EmuDriver::capture_final_writes(EmuEvents &out, const ViyConfig &cfg,
+                                     uint32_t run_id, uint64_t seed, size_t data_begin)
+{
+  if ( api_->mem_read == nullptr || cfg.max_runtime_bytes == 0 || data_begin >= out.data.size() )
+    return;
+
+  struct Range { uint64_t lo, hi; DataScope scope; };
+  std::vector<Range> ranges;
+  for ( size_t i = data_begin; i < out.data.size(); ++i )
+  {
+    const DataAcc &a = out.data[i];
+    if ( a.kind != RAX_MEM_WRITE || a.size == 0 || a.run_id != run_id )
+      continue;
+    const uint64_t hi = a.addr > std::numeric_limits<uint64_t>::max() - a.size
+                      ? std::numeric_limits<uint64_t>::max() : a.addr + a.size;
+    if ( hi <= a.addr )
+      continue;
+    ranges.push_back(Range{ a.addr, hi, a.scope });
+  }
+  std::sort(ranges.begin(), ranges.end(), [](const Range &a, const Range &b)
+  {
+    return std::tie(a.scope, a.lo, a.hi) < std::tie(b.scope, b.lo, b.hi);
+  });
+
+  std::vector<Range> merged;
+  for ( const Range &r : ranges )
+  {
+    if ( !merged.empty() && r.scope == merged.back().scope && r.lo <= merged.back().hi )
+      merged.back().hi = std::max(merged.back().hi, r.hi);
+    else
+      merged.push_back(r);
+  }
+
+  uint64_t remaining = cfg.max_runtime_bytes;
+  for ( const Range &r : merged )
+  {
+    if ( remaining == 0 )
+      break;
+    const uint64_t raw_len = r.hi - r.lo;
+    const size_t len = size_t(std::min<uint64_t>(raw_len, remaining));
+    if ( len == 0 )
+      continue;
+    MemoryBytes b;
+    b.addr = r.lo;
+    b.bytes.resize(len);
+    b.scope = r.scope;
+    b.run_id = run_id;
+    b.seed = seed;
+    if ( api_->mem_read(engine_, b.addr, b.bytes.data(), b.bytes.size()) != RAX_OK )
+      continue;
+    remaining -= b.bytes.size();
+    out.final_writes.push_back(std::move(b));
   }
 }
 
-void EmuDriver::restore_state()
+bool EmuDriver::restore_state()
 {
   // Restore the clean baseline (memory + registers) before each run so per-run
   // isolation holds: one function's stores and leftover register values can't
   // leak into the next. A captured baseline is REQUIRED for discovery (see
   // can_discover), so this always restores.
-  api_->context_restore(engine_, baseline_.data(), baseline_.size());
+  return api_->context_restore(engine_, baseline_.data(), baseline_.size()) == RAX_OK;
 }
 
 bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig &cfg, EmuEvents &out,
-                             EmuOutcome *outcome, bool record_pcs, uint64_t seed)
+                             EmuOutcome *outcome, bool record_pcs, uint64_t seed,
+                             uint32_t run_id, const EmuInput *input)
 {
   if ( !can_discover() )
     return false;
 
-  restore_state();
+  if ( outcome != nullptr )
+    *outcome = EmuOutcome{};
+  const uint64_t effective_seed = input != nullptr ? input->seed : seed;
+  const uint32_t effective_run = input != nullptr ? input->run_id : run_id;
+  const size_t data_begin = out.data.size();
 
-  const bool is64 = img_.arch == ViyArch::X86_64 || img_.arch == ViyArch::ARM64;
+  if ( !restore_state() )
+    return false;
+
+  const bool is64 = img_.arch == ViyArch::X86_64 || img_.arch == ViyArch::ARM64
+                 || img_.arch == ViyArch::RISCV64;
   const uint64_t align = is64 ? 0xFull : 0x3ull;
   uint64_t sp = (stack_base_ + stack_size_ - 0x400) & ~align;
   if ( img_.arch == ViyArch::X86_64 )
@@ -364,14 +1189,17 @@ bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig 
   const uint64_t sp_entry = sp;
 
   if ( sp_reg_ >= 0 )
-    api_->reg_write_u64(engine_, sp_reg_, sp);
+    if ( api_->reg_write_u64(engine_, sp_reg_, sp) != RAX_OK )
+      return false;
   if ( fp_reg_ >= 0 )
-    api_->reg_write_u64(engine_, fp_reg_, sp);
+    if ( api_->reg_write_u64(engine_, fp_reg_, sp) != RAX_OK )
+      return false;
 
   if ( lr_reg_ >= 0 )
   {
     // Link-register architectures (ARM): the return address lives in LR.
-    api_->reg_write_u64(engine_, lr_reg_, sentinel_);
+    if ( api_->reg_write_u64(engine_, lr_reg_, sentinel_) != RAX_OK )
+      return false;
   }
   else
   {
@@ -381,26 +1209,76 @@ bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig 
     uint64_t s = sentinel_;
     for ( size_t k = 0; k < ptr; ++k )
       buf[k] = (uint8_t)((s >> (8 * k)) & 0xFF);
-    api_->mem_write(engine_, sp, buf, ptr);
+    if ( api_->mem_write(engine_, sp, buf, ptr) != RAX_OK )
+      return false;
   }
 
-  if ( seed != 0 )
-    seed_arg_regs(seed); // vary conditional-branch directions across runs
+  if ( input != nullptr )
+  {
+    if ( effective_seed != 0 )
+      if ( !seed_arg_regs(effective_seed) )
+        return false;
+    if ( !apply_input(*input, sp) )
+      return false;
+  }
+  else if ( effective_seed != 0 )
+  {
+    if ( !seed_arg_regs(effective_seed) )
+      return false; // deterministic varied entry state
+  }
 
   HookCtx ctx;
   ctx.out = &out;
+  ctx.api = api_;
+  ctx.capture_regs = &capture_regs_;
+  ctx.summaries = &summaries_;
+  ctx.image = &img_;
   ctx.lo = img_.lo;
   ctx.hi = img_.hi;
   ctx.flo = entry;
   ctx.fhi = func_end > entry ? func_end : img_.hi;
+  const FuncRange *function = img_.function_at(entry);
+  ctx.func = function != nullptr && function->start == entry ? function : nullptr;
+  ctx.stack_lo = stack_base_;
+  ctx.stack_hi = stack_base_ + stack_size_;
+  ctx.heap_lo = stack_base_ + 0x10000;
+  ctx.heap_cursor = ctx.heap_lo;
+  ctx.heap_hi = stack_base_ + stack_size_ / 2;
+  ctx.sp_reg = sp_reg_;
+  ctx.lr_reg = lr_reg_;
+  ctx.pc_reg = pc_reg_;
+  ctx.ret_reg = ret_reg_;
+  ctx.arg_regs = &arg_regs_;
+  ctx.is64 = is64;
+  ctx.register_width = is64 ? 8 : 4;
+  ctx.big_endian = img_.big_endian;
+  ctx.strict_permissions = strict_perms_;
+  ctx.record_memory = cfg.want_drefs || cfg.want_runtime_strings
+                   || cfg.want_smc_evidence;
+  ctx.stack_argument_offset = viy_abi_layout(abi_).stack_argument_offset;
+  ctx.rax_arch = rax_arch_;
+  ctx.rax_mode = rax_mode_;
+  ctx.run_id = effective_run;
+  ctx.seed = effective_seed;
   ctx.record_pcs = record_pcs;
-  ctx.edge_cap = (size_t)cfg.max_insns;
-  ctx.data_cap = (size_t)cfg.max_insns;
+  const auto per_run_cap = [](size_t existing, uint64_t allowance)
+  {
+    const size_t increment = allowance > std::numeric_limits<size_t>::max()
+                           ? std::numeric_limits<size_t>::max()
+                           : static_cast<size_t>(allowance);
+    return increment > std::numeric_limits<size_t>::max() - existing
+         ? std::numeric_limits<size_t>::max() : existing + increment;
+  };
+  ctx.edge_cap = per_run_cap(out.edges.size(), cfg.max_insns);
+  ctx.execution_cap = per_run_cap(out.execution.size(), cfg.max_insns);
+  ctx.data_cap = per_run_cap(out.data.size(), cfg.max_insns);
+  ctx.state_cap = per_run_cap(out.states.size(),
+                              std::min<uint64_t>(cfg.max_insns, 65536));
 
   uint32_t code_id = 0, mem_id = 0, inv_id = 0;
   bool code_ok = api_->hook_add_code(engine_, 1, 0, code_tr, &ctx, &code_id) == RAX_OK;
   bool mem_ok = false;
-  if ( cfg.want_drefs && mem_hooks_ok_ )
+  if ( (ctx.record_memory || strict_perms_) && mem_hooks_ok_ )
   {
     mem_ok = api_->hook_add_mem(engine_,
                                 RAX_HOOK_MEM_READ | RAX_HOOK_MEM_WRITE,
@@ -408,30 +1286,63 @@ bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig 
   }
   bool inv_ok = api_->hook_add_invalid(engine_, inv_tr, &ctx, &inv_id) == RAX_OK;
 
+  const uint64_t icount_start = api_->emu_icount(engine_);
   if ( code_ok )
   {
-    const uint64_t timeout_us = cfg.timeout_ms * 1000ull;
-    api_->emu_start(engine_, entry, sentinel_, timeout_us, cfg.max_insns);
+    const uint64_t timeout_total = cfg.timeout_ms > std::numeric_limits<uint64_t>::max() / 1000
+                                 ? std::numeric_limits<uint64_t>::max()
+                                 : cfg.timeout_ms * 1000ull;
+    const auto wall_start = std::chrono::steady_clock::now();
+    uint64_t begin = entry;
+    for ( unsigned resumptions = 0; resumptions <= 256; ++resumptions )
+    {
+      const uint64_t used = api_->emu_icount(engine_) - icount_start;
+      if ( used >= cfg.max_insns )
+        break;
+      const uint64_t elapsed = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - wall_start).count());
+      if ( elapsed >= timeout_total )
+        break;
+      ctx.summary_resume = false;
+      const int status = api_->emu_start(engine_, begin, sentinel_,
+                                         timeout_total - elapsed, cfg.max_insns - used);
+      if ( status != RAX_OK || !ctx.summary_resume )
+        break;
+      if ( pc_reg_ < 0 || api_->reg_read_u64(engine_, pc_reg_, &begin) != RAX_OK )
+        break;
+    }
   }
 
   // Summarize the run for the function-level analyses (purge / no-return).
   if ( code_ok && outcome != nullptr )
   {
+    outcome->instruction_count = api_->emu_icount(engine_) - icount_start;
     rax_exit ex;
     std::memset(&ex, 0, sizeof(ex));
     if ( api_->emu_last_exit(engine_, &ex) == RAX_OK )
     {
+      outcome->stop_valid = true;
       outcome->stop_reason = ex.reason;
       outcome->stop_pc = ex.address;
       outcome->returned = ex.reason == RAX_STOP_UNTIL; // reached the sentinel
     }
+    outcome->terminated_process = ctx.terminated_process;
+    outcome->summarized_calls = ctx.summarized_calls;
     if ( outcome->returned && sp_reg_ >= 0 )
     {
       uint64_t sp_final = 0;
       if ( api_->reg_read_u64(engine_, sp_reg_, &sp_final) == RAX_OK )
       {
-        outcome->sp_delta = (int64_t)(sp_final - sp_entry);
-        outcome->sp_valid = true;
+        if ( sp_final >= sp_entry && sp_final - sp_entry <= uint64_t(std::numeric_limits<int64_t>::max()) )
+        {
+          outcome->sp_delta = int64_t(sp_final - sp_entry);
+          outcome->sp_valid = true;
+        }
+        else if ( sp_entry > sp_final && sp_entry - sp_final <= uint64_t(std::numeric_limits<int64_t>::max()) )
+        {
+          outcome->sp_delta = -int64_t(sp_entry - sp_final);
+          outcome->sp_valid = true;
+        }
       }
     }
   }
@@ -439,6 +1350,9 @@ bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig 
   if ( code_ok ) api_->hook_del(engine_, code_id);
   if ( mem_ok )  api_->hook_del(engine_, mem_id);
   if ( inv_ok )  api_->hook_del(engine_, inv_id);
+
+  if ( code_ok )
+    capture_final_writes(out, cfg, effective_run, effective_seed, data_begin);
 
   return code_ok;
 }

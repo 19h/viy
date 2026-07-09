@@ -2,14 +2,17 @@
 # plugin, staging both artifacts into ./build, and can deploy them into IDA.
 #
 #   make                 # build librax + viy into ./build
-#   make install         # deploy build/viy.* and build/librax.* into $IDABIN/plugins
+#   make install         # deploy into $PLUGIN_DIR (or the per-user IDA plugins dir)
+#   make install-app     # deploy into $IDABIN/plugins
 #   make clean
 #
 # Required env:
 #   IDASDK   path to the IDA SDK (for building the plugin)
 # Optional env:
-#   IDABIN         IDA install dir (for `make install`)
-#   IDA_CMAKE_DIR  ida-cmake checkout (else the CMakeLists default is used)
+#   IDABIN         IDA install dir (for `make install-app`)
+#   IDAUSR         per-user IDA root (first entry; used by `make install`)
+#   PLUGIN_DIR     explicit user-plugin destination for `make install`
+#   IDA_CMAKE_DIR  ida-cmake checkout (or set it in the environment)
 #   BUILD_DIR      output dir (default: build)
 #   DEBUG=1        Debug build
 
@@ -47,7 +50,7 @@ IDA_USER_DIR := $(firstword $(subst :, ,$(IDAUSR)))
 endif
 PLUGIN_DIR ?= $(IDA_USER_DIR)/plugins
 
-.PHONY: all build rax viy configure install install-app submodules clean distclean help
+.PHONY: all build rax viy configure test test-ida install install-app submodules clean distclean help
 
 all: build
 
@@ -74,6 +77,15 @@ configure: submodules
 viy: configure
 	cmake --build "$(BUILD_DIR)" --parallel
 	@echo "staged $(BUILD_DIR)/$(VIY_LIB)"
+
+## test: rax C-ABI tests plus all IDA-free viy CTest targets
+test: build
+	cargo test -p rax-capi --manifest-path "$(RAX_DIR)/Cargo.toml"
+	ctest --test-dir "$(BUILD_DIR)" --output-on-failure
+
+## test-ida: licensed real-IDAT evidence persistence/corruption recovery test
+test-ida: build
+	BUILD_DIR="$(abspath $(BUILD_DIR))" tests/run_ida_evidence_persistence.sh
 
 # viy.dylib goes directly in plugins/ (IDA loads it); librax.dylib goes in a
 # plugins/viy/ subdir so IDA does NOT try to load it as a plugin. The loader
@@ -110,6 +122,8 @@ help:
 	@echo "  make viy           build + stage the plugin only"
 	@echo "  make install       deploy viy + librax into $(PLUGIN_DIR)"
 	@echo "  make install-app   deploy into the IDA install dir (\$$IDABIN/plugins)"
+	@echo "  make test          run rax ABI and IDA-free viy tests"
+	@echo "  make test-ida      run the licensed real-IDAT recovery integration test"
 	@echo "  make clean         remove ./$(BUILD_DIR)"
 	@echo ""
 	@echo "Env: IDASDK (required to build), IDAUSR or PLUGIN_DIR (install location),"

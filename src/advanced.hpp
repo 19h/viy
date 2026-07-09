@@ -45,4 +45,13 @@ void viy_advanced(ViyArch arch, uint64_t func_start, uint64_t func_end,
                   bool noret_corroborated,
                   const ViyConfig &cfg, AdvStats &stats);
 
+// Chunk-aware form.  Prefer this overload for snapshots produced by
+// viy_snapshot(); it treats every non-contiguous function tail as part of the
+// same analysis scope while retaining `function.start` as the metadata owner.
+void viy_advanced(ViyArch arch, const FuncRange &function,
+                  const EmuEvents &ev, const EmuOutcome &outcome,
+                  const std::unordered_set<uint64_t> &reached,
+                  bool noret_corroborated,
+                  const ViyConfig &cfg, AdvStats &stats);
+
 } // namespace viy

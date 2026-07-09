@@ -110,7 +110,7 @@ _deps
 node_modules/
 
 # Build directories
-/build-kvasir/
+/build-*/
 [Bb]uild/
 [Dd]ebug/
 [Rr]elease/

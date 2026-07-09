@@ -31,9 +31,9 @@ bool target_ok_code(ea_t to)
   return s != nullptr && (s->perm == 0 || (s->perm & SEGPERM_EXEC) != 0);
 }
 
-bool in_func(ea_t ea, ea_t lo, ea_t hi)
+bool in_func(ea_t ea, const FuncRange &function)
 {
-  return ea >= lo && ea < hi;
+  return function.contains(uint64_t(ea));
 }
 
 qstring ea_label(ea_t ea)
@@ -66,7 +66,7 @@ const char *stop_reason_name(int r)
 }
 
 // ---- switch reconstruction ----------------------------------------------
-void do_switches(ea_t lo, ea_t hi, const EmuEvents &ev, AdvStats &stats)
+void do_switches(const FuncRange &function, const EmuEvents &ev, AdvStats &stats)
 {
   // Group each indirect jump's observed targets.
   std::unordered_map<ea_t, std::vector<ea_t>> groups;
@@ -74,7 +74,7 @@ void do_switches(ea_t lo, ea_t hi, const EmuEvents &ev, AdvStats &stats)
   {
     const ea_t from = (ea_t)e.from;
     const ea_t to   = (ea_t)e.to;
-    if ( !in_func(from, lo, hi) || !target_ok_code(to) )
+    if ( !in_func(from, function) || !target_ok_code(to) )
       continue;
     insn_t insn;
     if ( decode_insn(&insn, from) <= 0 )
@@ -181,19 +181,36 @@ void do_noret(ea_t lo, const EmuOutcome &outcome, bool corroborated,
 }
 
 // ---- argument-register inference (static read-before-write) -------------
-void do_argregs(ViyArch arch, ea_t lo, ea_t hi, const ViyConfig &cfg, AdvStats &stats)
+void do_argregs(ViyArch arch, const FuncRange &function,
+                const ViyConfig &cfg, AdvStats &stats)
 {
   if ( !cfg.want_argregs || !cfg.want_comments )
     return;
 
   // Candidate integer argument registers, resolved to IDA reg ids by name.
-  static const char *x64[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+  static const char *x64_sysv[] = { "rdi", "rsi", "rdx", "rcx", "r8", "r9" };
+  static const char *x64_win[] = { "rcx", "rdx", "r8", "r9" };
   static const char *a64[] = { "X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7" };
+  static const char *a32[] = { "R0", "R1", "R2", "R3" };
+  static const char *rv64[] = { "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7" };
+  static const char *hex[] = { "R0", "R1", "R2", "R3", "R4", "R5" };
   const char *const *names = nullptr;
   size_t nnames = 0;
   int width = 8;
-  if ( arch == ViyArch::X86_64 ) { names = x64; nnames = 6; width = 8; }
+  if ( arch == ViyArch::X86_64 )
+  {
+    const bool windows = inf_get_filetype() == f_PE;
+    names = windows ? x64_win : x64_sysv;
+    nnames = windows ? qnumber(x64_win) : qnumber(x64_sysv);
+    width = 8;
+  }
   else if ( arch == ViyArch::ARM64 ) { names = a64; nnames = 8; width = 8; }
+  else if ( arch == ViyArch::ARM32 || arch == ViyArch::CORTEX_M )
+    { names = a32; nnames = qnumber(a32); width = 4; }
+  else if ( arch == ViyArch::RISCV64 )
+    { names = rv64; nnames = qnumber(rv64); width = 8; }
+  else if ( arch == ViyArch::HEXAGON )
+    { names = hex; nnames = qnumber(hex); width = 4; }
   else return; // only well-defined reg-arg ABIs
 
   std::vector<int> arg_ids;
@@ -209,9 +226,13 @@ void do_argregs(ViyArch arch, ea_t lo, ea_t hi, const ViyConfig &cfg, AdvStats &
 
   std::unordered_set<int> written;
   std::vector<int> found; // arg regs read before being written, in encounter order
+  const ea_t lo = ea_t(function.start);
   ea_t ea = lo;
-  for ( int steps = 0; steps < 64 && ea != BADADDR && ea < hi; ++steps )
+  std::unordered_set<ea_t> visited;
+  for ( int steps = 0; steps < 64 && ea != BADADDR && in_func(ea, function); ++steps )
   {
+    if ( !visited.insert(ea).second )
+      break;
     insn_t insn;
     if ( decode_insn(&insn, ea) <= 0 )
       break;
@@ -246,7 +267,32 @@ void do_argregs(ViyArch arch, ea_t lo, ea_t hi, const ViyConfig &cfg, AdvStats &
 
     if ( is_call_insn(insn) )
       break; // a call clobbers caller-saved regs; stop inferring
-    ea += insn.size;
+
+    ea_t next = ea + insn.size;
+    if ( (feat & CF_STOP) != 0 && !is_ret_insn(insn) )
+    {
+      // Follow a single direct in-function successor.  This handles entry
+      // stubs whose body lives in a non-contiguous tail without turning the
+      // hint into a speculative multi-path dataflow result.
+      ea_t sole = BADADDR;
+      size_t count = 0;
+      xrefblk_t xb;
+      for ( bool ok = xb.first_from(ea, XREF_CODE | XREF_NOFLOW);
+            ok; ok = xb.next_from() )
+      {
+        if ( in_func(xb.to, function) )
+        {
+          sole = xb.to;
+          ++count;
+        }
+      }
+      if ( count != 1 )
+        break;
+      next = sole;
+    }
+    if ( !in_func(next, function) )
+      break;
+    ea = next;
   }
 
   if ( found.empty() )
@@ -265,60 +311,69 @@ void do_argregs(ViyArch arch, ea_t lo, ea_t hi, const ViyConfig &cfg, AdvStats &
 }
 
 // ---- opaque predicate / dead branch (comment hint) ----------------------
-void do_opaque(ea_t lo, ea_t hi, const std::unordered_set<uint64_t> &reached,
+void do_opaque(const FuncRange &function,
+               const std::unordered_set<uint64_t> &reached,
                const ViyConfig &cfg, AdvStats &stats)
 {
   if ( !cfg.want_opaque || reached.empty() )
     return;
 
-  ea_t ea = lo;
-  while ( ea != BADADDR && ea < hi )
+  std::vector<FuncChunk> chunks = function.chunks;
+  if ( chunks.empty() )
+    chunks.push_back(FuncChunk{ function.start, function.end });
+  for ( const FuncChunk &chunk : chunks )
   {
-    const flags64_t ff = get_flags(ea);
-    if ( is_code(ff) && is_head(ff) && reached.count((uint64_t)ea) != 0 )
+    ea_t ea = ea_t(chunk.start);
+    const ea_t hi = ea_t(chunk.end);
+    while ( ea != BADADDR && ea < hi )
     {
-      insn_t insn;
-      if ( decode_insn(&insn, ea) > 0 )
+      const flags64_t ff = get_flags(ea);
+      if ( is_code(ff) && is_head(ff) && reached.count((uint64_t)ea) != 0 )
       {
-        const uint32 feat = insn.get_canon_feature(PH);
-        // A 2-way conditional branch: flow continues (not CF_STOP) and it is not
-        // a call (a call also has a non-flow code xref to its callee, which must
-        // not be mistaken for a branch target).
-        if ( (feat & (CF_STOP | CF_CALL)) == 0 && !is_call_insn(insn) )
+        insn_t insn;
+        if ( decode_insn(&insn, ea) > 0 )
         {
-          // the non-flow code target of this instruction (the branch target)
-          ea_t T = BADADDR;
-          xrefblk_t xb;
-          for ( bool ok = xb.first_from(ea, XREF_CODE | XREF_NOFLOW); ok; ok = xb.next_from() )
+          const uint32 feat = insn.get_canon_feature(PH);
+          // A 2-way conditional branch: flow continues (not CF_STOP) and it is not
+          // a call (a call also has a non-flow code xref to its callee, which must
+          // not be mistaken for a branch target).
+          if ( (feat & (CF_STOP | CF_CALL)) == 0 && !is_call_insn(insn) )
           {
-            T = xb.to;
-            break;
-          }
-          const ea_t F = ea + insn.size;
-          if ( T != BADADDR && T != F )
-          {
-            const bool tR = reached.count((uint64_t)T) != 0;
-            const bool fR = reached.count((uint64_t)F) != 0;
-            if ( tR != fR ) // exactly one side ever reached => the other looks dead
+            // the non-flow code target of this instruction (the branch target)
+            ea_t T = BADADDR;
+            xrefblk_t xb;
+            for ( bool ok = xb.first_from(ea, XREF_CODE | XREF_NOFLOW);
+                  ok; ok = xb.next_from() )
             {
-              qstring txt;
-              if ( tR )
-                txt.sprnt("viy: predicate always taken (fall-through %s never reached in %d runs)",
-                          ea_label(F).c_str(), cfg.opaque_runs);
-              else
-                txt.sprnt("viy: predicate always not-taken (branch %s never reached in %d runs)",
-                          ea_label(T).c_str(), cfg.opaque_runs);
-              if ( add_rpt_comment(ea, txt.c_str()) )
-                ++stats.opaque;
+              T = xb.to;
+              break;
+            }
+            const ea_t F = ea + insn.size;
+            if ( T != BADADDR && T != F )
+            {
+              const bool tR = reached.count((uint64_t)T) != 0;
+              const bool fR = reached.count((uint64_t)F) != 0;
+              if ( tR != fR ) // exactly one side ever reached => the other looks dead
+              {
+                qstring txt;
+                if ( tR )
+                  txt.sprnt("viy: predicate always taken (fall-through %s never reached in %d runs)",
+                            ea_label(F).c_str(), cfg.opaque_runs);
+                else
+                  txt.sprnt("viy: predicate always not-taken (branch %s never reached in %d runs)",
+                            ea_label(T).c_str(), cfg.opaque_runs);
+                if ( add_rpt_comment(ea, txt.c_str()) )
+                  ++stats.opaque;
+              }
             }
           }
         }
       }
+      const ea_t nxt = next_head(ea, hi);
+      if ( nxt <= ea )
+        break;
+      ea = nxt;
     }
-    const ea_t nxt = next_head(ea, hi);
-    if ( nxt <= ea )
-      break;
-    ea = nxt;
   }
 }
 
@@ -330,17 +385,31 @@ void viy_advanced(ViyArch arch, uint64_t func_start, uint64_t func_end,
                   bool noret_corroborated,
                   const ViyConfig &cfg, AdvStats &stats)
 {
-  const ea_t lo = (ea_t)func_start;
-  const ea_t hi = (ea_t)(func_end > func_start ? func_end : func_start);
-  if ( hi <= lo )
+  FuncRange function;
+  function.start = func_start;
+  function.end = func_end;
+  if ( func_end > func_start )
+    function.chunks.push_back(FuncChunk{ func_start, func_end });
+  viy_advanced(arch, function, ev, outcome, reached,
+               noret_corroborated, cfg, stats);
+}
+
+void viy_advanced(ViyArch arch, const FuncRange &function,
+                  const EmuEvents &ev, const EmuOutcome &outcome,
+                  const std::unordered_set<uint64_t> &reached,
+                  bool noret_corroborated,
+                  const ViyConfig &cfg, AdvStats &stats)
+{
+  if ( function.end <= function.start && function.chunks.empty() )
     return;
+  const ea_t lo = ea_t(function.start);
 
   if ( cfg.want_switch )
-    do_switches(lo, hi, ev, stats);
+    do_switches(function, ev, stats);
   do_purge(arch, lo, outcome, cfg, stats);
   do_noret(lo, outcome, noret_corroborated, cfg, stats);
-  do_argregs(arch, lo, hi, cfg, stats);
-  do_opaque(lo, hi, reached, cfg, stats);
+  do_argregs(arch, function, cfg, stats);
+  do_opaque(function, reached, cfg, stats);
 }
 
 } // namespace viy

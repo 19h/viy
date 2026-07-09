@@ -18,43 +18,11 @@
 #include <xref.hpp>
 #include <segregs.hpp>
 
+#include "decoder_core.hpp"
+
 namespace viy {
 
 namespace {
-
-// rax decode parameters for a ViyArch. For AArch32 the ARM-vs-Thumb mode is not
-// fixed for the whole image — it changes per address (interworking) — so
-// `per_insn_thumb` is set and the caller resolves the mode from IDA's T segment
-// register at each instruction. x86-16 (seg:off) is not handled.
-struct DecodeArch
-{
-  bool     ok = false;
-  int      rax_arch = 0;
-  uint32_t base_mode = 0;      // endianness / fixed bitness bits
-  bool     per_insn_thumb = false; // AArch32: OR in RAX_MODE_ARM/THUMB per insn
-};
-
-DecodeArch decode_arch_for(ViyArch a, bool be)
-{
-  DecodeArch d;
-  const uint32_t endian = be ? RAX_MODE_BIG_ENDIAN : RAX_MODE_LITTLE_ENDIAN;
-  switch ( a )
-  {
-    case ViyArch::X86_32:
-      d = { true, RAX_ARCH_X86, RAX_MODE_32, false }; break;
-    case ViyArch::X86_64:
-      d = { true, RAX_ARCH_X86, RAX_MODE_64, false }; break;
-    case ViyArch::ARM64:
-      d = { true, RAX_ARCH_ARM64, endian, false }; break;
-    case ViyArch::ARM32:
-      // ARMv7 / AArch32 (and Cortex-M, which is Thumb-only) — rax decodes both
-      // ARM and Thumb; the state comes from IDA per address.
-      d = { true, RAX_ARCH_ARM, endian, true }; break;
-    default:
-      break;
-  }
-  return d;
-}
 
 // Does IDA already record a resolved outgoing code TARGET from `ea`?
 // XREF_NOFLOW excludes the ordinary fall-through (fl_F) cref that every call and
@@ -78,13 +46,14 @@ void viy_static_decode_func(const RaxApi *api, ViyArch arch, bool big_endian,
   if ( api == nullptr || api->decode == nullptr )
     return; // older librax without the static decoder — nothing to do
 
-  const DecodeArch da = decode_arch_for(arch, big_endian);
-  if ( !da.ok )
+  const DecoderArchitecture da =
+      viy_decoder_architecture(arch, big_endian);
+  if ( !da.valid )
     return;
 
   // AArch32 needs IDA's T (Thumb) segment register to pick ARM vs Thumb per
   // address. Resolve its register number once (-1 if the processor has none).
-  const int t_reg = da.per_insn_thumb ? str2reg("T") : -1;
+  const int t_reg = da.per_instruction_thumb ? str2reg("T") : -1;
 
   const ea_t end = (ea_t)func_end;
   ea_t ea = (ea_t)func_start;
@@ -105,26 +74,33 @@ void viy_static_decode_func(const RaxApi *api, ViyArch arch, bool big_endian,
         const bool transfer = (feat & (CF_CALL | CF_JUMP | CF_STOP)) != 0;
         if ( transfer && !has_outgoing_cref(ea) )
         {
-          uint32_t mode = da.base_mode;
-          if ( da.per_insn_thumb )
+          DecoderArmState arm_state = DecoderArmState::Unknown;
+          if ( da.per_instruction_thumb )
           {
-            const sel_t t = t_reg >= 0 ? get_sreg(ea, t_reg) : sel_t(0);
-            mode |= (t != 0 && t != BADSEL) ? RAX_MODE_THUMB : RAX_MODE_ARM;
+            const sel_t t = t_reg >= 0 ? get_sreg(ea, t_reg) : BADSEL;
+            if ( t != BADSEL )
+              arm_state = t == 0 ? DecoderArmState::Arm
+                                 : DecoderArmState::Thumb;
           }
-
-          uint8_t buf[kMaxInsnBytes];
-          const ssize_t got = get_bytes(buf, (ssize_t)sizeof(buf), ea, GMB_READALL);
-          if ( got > 0 )
+          uint32_t mode = 0;
+          const size_t wanted = viy_decoder_window_size(
+              uint64_t(ea), uint64_t(end), kMaxInsnBytes);
+          if ( wanted != 0 && viy_decoder_mode(da, arm_state, mode) )
           {
-            rax_decoded d;
-            if ( api->decode(da.rax_arch, mode, (uint64_t)ea, buf, (size_t)got, &d) == RAX_OK
-              && d.valid != 0 && d.has_target != 0
-              && (d.flow == RAX_FLOW_CALL
-               || d.flow == RAX_FLOW_BRANCH
-               || d.flow == RAX_FLOW_COND_BRANCH) )
+            uint8_t buf[kMaxInsnBytes] = {};
+            const ssize_t got = get_bytes(buf, ssize_t(wanted), ea, GMB_READALL);
+            if ( got > 0 )
             {
-              const bool is_call = d.flow == RAX_FLOW_CALL;
-              viy_try_add_cref((uint64_t)ea, d.target, is_call, cfg, stats);
+              const DecoderDecodeResult decoded = viy_decode_one(
+                  api->decode, da.rax_arch, mode, uint64_t(ea), buf, size_t(got));
+              const DecoderDirectTarget target =
+                  viy_decoder_direct_target(decoded.instruction);
+              if ( decoded.status == DecoderDecodeStatus::Valid && target.valid )
+              {
+                const bool is_call = target.kind == DecoderTargetKind::Call;
+                viy_try_add_cref(uint64_t(ea), target.address,
+                                 is_call, cfg, stats);
+              }
             }
           }
         }

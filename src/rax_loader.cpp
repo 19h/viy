@@ -13,6 +13,12 @@
 #include <mutex>
 #include <string>
 
+#if defined(__APPLE__)
+#  include <mach-o/dyld.h> // _NSGetExecutablePath
+#elif defined(__linux__)
+#  include <unistd.h>      // readlink
+#endif
+
 namespace viy {
 
 namespace {
@@ -47,6 +53,33 @@ std::string self_dir()
   return path.substr(0, slash + 1); // keep trailing separator
 }
 
+// Directory of the host executable (the IDA binary). Lets librax sit in the
+// "IDA folder" and still be found. Empty on failure / unsupported platforms.
+std::string main_exe_dir()
+{
+  std::string p;
+#if defined(__APPLE__)
+  char buf[4096];
+  uint32_t sz = sizeof(buf);
+  if ( _NSGetExecutablePath(buf, &sz) != 0 )
+    return {};
+  p = buf;
+#elif defined(__linux__)
+  char buf[4096];
+  ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if ( n <= 0 )
+    return {};
+  buf[n] = '\0';
+  p = buf;
+#else
+  return {};
+#endif
+  auto slash = p.find_last_of("/\\");
+  if ( slash == std::string::npos )
+    return {};
+  return p.substr(0, slash + 1);
+}
+
 void *try_dlopen()
 {
   const int mode = RTLD_NOW | RTLD_LOCAL;
@@ -60,7 +93,16 @@ void *try_dlopen()
   if ( void *h = dlopen(kBareName, mode) )
     return h;
 
+  // Next to the viy plugin binary (…/plugins/librax.dylib).
   if ( std::string dir = self_dir(); !dir.empty() )
+  {
+    std::string sib = dir + kBareName;
+    if ( void *h = dlopen(sib.c_str(), mode) )
+      return h;
+  }
+
+  // In the IDA folder (next to the ida/ida64 executable).
+  if ( std::string dir = main_exe_dir(); !dir.empty() )
   {
     std::string sib = dir + kBareName;
     if ( void *h = dlopen(sib.c_str(), mode) )

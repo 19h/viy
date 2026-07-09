@@ -58,29 +58,40 @@ flow) — together they resolve targets a single static pass had to leave blank.
 
 ## Building
 
-Requires the IDA SDK, kvasir's `ida-cmake`, and the rax C API headers.
+rax is vendored as a git submodule under `vendor/rax`, so a recursive clone (or
+`git submodule update --init`) is all you need besides the IDA SDK and kvasir's
+`ida-cmake`. The `Makefile` builds **both** librax (from the submodule, via
+cargo) and the viy plugin, staging both artifacts into `build/`:
 
 ```sh
-export IDASDK=/path/to/ida-sdk          # required
-export IDABIN=/path/to/ida              # optional: where the plugin is installed
-cmake -S . -B build \
-  -DIDA_CMAKE_DIR=/path/to/ida-cmake \
-  -DRAX_CAPI_DIR=/path/to/rax/capi
-cmake --build build
+git submodule update --init --depth 1 vendor/rax   # if not cloned recursively
+export IDASDK=/path/to/ida-sdk                      # required
+export IDA_CMAKE_DIR=/path/to/ida-cmake             # optional (has a default)
+make                                                # -> build/viy.dylib + build/librax.dylib
 ```
 
-The output is `viy.dylib` / `viy.so` / `viy.dll` (no `lib` prefix), installed
-into IDA's plugins directory. Nothing links librax.
+`make help` lists the targets. viy itself links nothing against librax — the
+header (`vendor/rax/capi/include/rax.h`) is used only for the ABI typedefs, and
+librax is `dlopen`'d at runtime.
 
-## Deploying librax
+## Installing / deploying librax
 
-Drop the built `librax.dylib` / `librax.so` where viy can `dlopen` it:
+```sh
+export IDABIN=/path/to/ida        # your IDA install dir
+make install                      # viy.* AND librax.* -> $IDABIN/plugins
+# or:
+make install-ida-folder           # viy.* -> $IDABIN/plugins ; librax.* -> $IDABIN (the IDA folder)
+```
 
-- next to the `viy` plugin binary, **or**
-- anywhere on the platform loader search path, **or**
-- point `VIY_RAX_PATH` at the exact file.
+librax is found at runtime, in this order:
 
-No librax, no problem — viy just stays quiet.
+1. `$VIY_RAX_PATH` (explicit path), then
+2. the platform loader search path, then
+3. **next to the `viy` plugin binary** (`…/plugins/librax.*`), then
+4. **the IDA folder** (next to the `ida`/`ida64` executable).
+
+So dropping librax either next to the plugin or in the IDA folder just works. No
+librax, no problem — viy stays a silent no-op.
 
 ## Configuration (environment overrides)
 

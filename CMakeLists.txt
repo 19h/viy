@@ -36,11 +36,15 @@ include("${IDA_CMAKE_DIR}/bootstrap.cmake")  # validates $IDASDK, sets CMAKE_PRE
 find_package(idasdk REQUIRED)                 # -> idasdk::plugin + ida_add_plugin()
 
 # --- rax C API: header only (dlopen'd at runtime, never linked) ---------------
-set(RAX_CAPI_DIR "/Users/int/dev/rax/capi" CACHE PATH "rax capi dir (contains include/rax.h)")
+# Defaults to the vendored submodule (vendor/rax). librax itself is built
+# separately (see the Makefile / `cargo build -p rax-capi`); viy only needs the
+# header here.
+set(RAX_CAPI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/capi" CACHE PATH "rax capi dir (contains include/rax.h)")
 if(NOT EXISTS "${RAX_CAPI_DIR}/include/rax.h")
   message(FATAL_ERROR
     "rax.h not found under '${RAX_CAPI_DIR}/include'. "
-    "Set -DRAX_CAPI_DIR=/path/to/rax/capi.")
+    "Did you clone submodules? (git submodule update --init) "
+    "or set -DRAX_CAPI_DIR=/path/to/rax/capi.")
 endif()
 
 # --- The plugin ---------------------------------------------------------------
@@ -63,5 +67,12 @@ ida_add_plugin(viy
 
 # dlopen/dlsym for the runtime librax loader (empty on macOS, -ldl on Linux).
 target_link_libraries(viy PRIVATE ${CMAKE_DL_LIBS})
+
+# Emit the plugin into the build tree (the Makefile stages librax next to it).
+# This overrides ida_add_plugin's default of installing straight into
+# IDA_PLUGIN_DIR; use `make install` (or the install target) to deploy.
+set_target_properties(viy PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 message(STATUS "viy: IDASDK=$ENV{IDASDK}  ida-cmake=${IDA_CMAKE_DIR}  rax=${RAX_CAPI_DIR}/include (header-only)")

@@ -1,0 +1,31 @@
+/*
+ * viy_config.hpp — runtime caps for the emulation sweep.
+ *
+ * Configuration is intentionally minimal and dependency-light: sane defaults,
+ * overridable via environment variables (so it stays invisible — no dialogs, no
+ * required files). See viy.cfg for the documented knobs.
+ */
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+namespace viy {
+
+struct ViyConfig
+{
+  bool     enabled       = true;    // master switch (VIY_ENABLED=0 disables)
+  uint64_t max_insns     = 200000;  // per-run instruction cap (bounds runaway/loops)
+  uint64_t timeout_ms    = 1000;    // per-run wall-clock cap
+  uint64_t max_funcs     = 0;       // 0 = every function; else stop after N entries
+  int      funcs_per_tick = 2;      // functions emulated per UI timer tick (keeps UI live)
+  int      tick_ms       = 15;      // timer cadence
+  bool     make_code     = true;    // auto_make_code/plan_ea on discovered code targets
+  bool     want_drefs    = true;    // record data references (needs a recording backend)
+  bool     want_static   = true;    // run the rax static-decode cross-check pass (rax >= 1.2)
+};
+
+// Load config from environment overrides on top of the defaults above.
+ViyConfig viy_load_config();
+
+} // namespace viy

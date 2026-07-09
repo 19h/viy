@@ -75,21 +75,25 @@ viy: configure
 	cmake --build "$(BUILD_DIR)" --parallel
 	@echo "staged $(BUILD_DIR)/$(VIY_LIB)"
 
-## install: deploy the plugin AND librax into the user IDA plugins dir
-## (~/.idapro/plugins by default; librax sits next to viy so it is found).
+# viy.dylib goes directly in plugins/ (IDA loads it); librax.dylib goes in a
+# plugins/viy/ subdir so IDA does NOT try to load it as a plugin. The loader
+# finds it there (companion_dir search).
+define install_to
+	mkdir -p "$(1)/viy"
+	cp "$(BUILD_DIR)/$(VIY_LIB)" "$(1)/$(VIY_LIB)"
+	cp "$(BUILD_DIR)/$(RAX_LIB)" "$(1)/viy/$(RAX_LIB)"
+	rm -f "$(1)/$(RAX_LIB)"   # remove any librax left in plugins/ by an older install
+	@echo "installed $(VIY_LIB) -> $(1) ; $(RAX_LIB) -> $(1)/viy"
+endef
+
+## install: deploy into the user IDA plugins dir (~/.idapro/plugins by default)
 install: build
-	mkdir -p "$(PLUGIN_DIR)"
-	cp "$(BUILD_DIR)/$(VIY_LIB)" "$(PLUGIN_DIR)/$(VIY_LIB)"
-	cp "$(BUILD_DIR)/$(RAX_LIB)" "$(PLUGIN_DIR)/$(RAX_LIB)"
-	@echo "installed $(VIY_LIB) + $(RAX_LIB) -> $(PLUGIN_DIR)"
+	$(call install_to,$(PLUGIN_DIR))
 
 ## install-app: deploy into the IDA *install* dir instead ($IDABIN/plugins)
 install-app: build
 	@test -n "$(IDABIN)" || { echo "error: set IDABIN=/path/to/ida"; exit 1; }
-	mkdir -p "$(IDABIN)/plugins"
-	cp "$(BUILD_DIR)/$(VIY_LIB)" "$(IDABIN)/plugins/$(VIY_LIB)"
-	cp "$(BUILD_DIR)/$(RAX_LIB)" "$(IDABIN)/plugins/$(RAX_LIB)"
-	@echo "installed $(VIY_LIB) + $(RAX_LIB) -> $(IDABIN)/plugins"
+	$(call install_to,$(IDABIN)/plugins)
 
 ## clean: remove the build directory
 clean:

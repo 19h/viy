@@ -98,15 +98,26 @@ make install                      # viy.* AND librax.* -> ~/.idapro/plugins (the
 make install-app IDABIN=/path/to/ida   # into the IDA *install* dir instead
 ```
 
+This lays out:
+
+```
+~/.idapro/plugins/viy.dylib        # the plugin (IDA loads this)
+~/.idapro/plugins/viy/librax.dylib # the engine (IDA does NOT scan this subdir)
+```
+
+librax lives in the `viy/` subdirectory on purpose: IDA treats every dylib
+directly under `plugins/` as a plugin, and librax isn't one — putting it in a
+subdir keeps IDA from trying (and failing) to load it as a plugin.
+
 librax is found at runtime, in this order:
 
 1. `$VIY_RAX_PATH` (explicit path), then
 2. the platform loader search path, then
-3. **next to the `viy` plugin binary** (`…/plugins/librax.*`), then
-4. **the IDA folder** (next to the `ida`/`ida64` executable).
+3. **the companion subdir** (`…/plugins/viy/librax.*`) — the install location, then
+4. **next to the `viy` plugin binary** (`…/plugins/librax.*`), then
+5. **the IDA folder** (next to the `ida`/`ida64` executable).
 
-So dropping librax either next to the plugin or in the IDA folder just works. No
-librax, no problem — viy stays a silent no-op.
+No librax, no problem — viy stays a silent no-op.
 
 ## Configuration (environment overrides)
 

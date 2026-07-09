@@ -53,6 +53,28 @@ std::string self_dir()
   return path.substr(0, slash + 1); // keep trailing separator
 }
 
+// A resource directory named after this plugin, next to it: e.g. for a plugin
+// at …/plugins/viy.dylib this returns …/plugins/viy/ . librax is installed there
+// so IDA (which scans …/plugins/*.dylib for plugins) never tries to load it.
+std::string companion_dir()
+{
+  Dl_info info{};
+  if ( dladdr(reinterpret_cast<const void *>(&companion_dir), &info) == 0
+    || info.dli_fname == nullptr )
+  {
+    return {};
+  }
+  std::string p = info.dli_fname;
+  auto slash = p.find_last_of("/\\");
+  std::string dir  = slash == std::string::npos ? std::string() : p.substr(0, slash + 1);
+  std::string file = slash == std::string::npos ? p : p.substr(slash + 1);
+  auto dot = file.find_last_of('.');
+  std::string stem = dot == std::string::npos ? file : file.substr(0, dot);
+  if ( stem.empty() )
+    return {};
+  return dir + stem + "/"; // …/plugins/viy/
+}
+
 // Directory of the host executable (the IDA binary). Lets librax sit in the
 // "IDA folder" and still be found. Empty on failure / unsupported platforms.
 std::string main_exe_dir()
@@ -92,6 +114,15 @@ void *try_dlopen()
 
   if ( void *h = dlopen(kBareName, mode) )
     return h;
+
+  // In a companion resource dir (…/plugins/viy/librax.dylib) — the recommended
+  // install layout, since IDA won't try to load it as a plugin from there.
+  if ( std::string dir = companion_dir(); !dir.empty() )
+  {
+    std::string p = dir + kBareName;
+    if ( void *h = dlopen(p.c_str(), mode) )
+      return h;
+  }
 
   // Next to the viy plugin binary (…/plugins/librax.dylib).
   if ( std::string dir = self_dir(); !dir.empty() )

@@ -27,6 +27,15 @@ struct ViyConfig
   bool     want_ptr_refs = true;    // materialize in-image pointers loaded from memory (offset + dref)
   bool     want_data_types = true;  // type undefined globals by observed access size
   bool     want_comments = true;    // repeatable comments naming what rax resolved
+  bool     want_strings  = true;    // detect + create C strings at observed data reads
+  // Advanced (function-level) analyses:
+  bool     want_switch   = false;   // reconstruct switches (opt-in: emulation coverage may be partial)
+  bool     want_purge    = true;    // set callee stack purge (x86) from the emulation SP delta
+  bool     want_noret    = true;    // COMMENT-hint no-return functions
+  bool     set_noret     = false;   // actually set FUNC_NORET (opt-in; re-flows callers)
+  bool     want_argregs  = true;    // COMMENT-hint inferred argument registers
+  bool     want_opaque   = false;   // multi-run opaque-predicate / dead-branch hints (comment)
+  int      opaque_runs   = 3;       // emulation runs used for opaque detection
 };
 
 // Load config from environment overrides on top of the defaults above.

@@ -25,6 +25,7 @@ struct EnrichStats
 {
   size_t ptr_refs = 0; // in-image pointers materialized (offset + dref)
   size_t typed    = 0; // undefined globals given a data type
+  size_t strings  = 0; // C strings detected + created
   size_t comments = 0; // annotations added
 };
 

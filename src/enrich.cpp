@@ -12,6 +12,7 @@
 #include <segment.hpp>
 #include <name.hpp>
 #include <offset.hpp>
+#include <nalt.hpp>
 
 namespace viy {
 
@@ -67,6 +68,29 @@ bool type_scalar(ea_t ea, uint32_t length)
   }
 }
 
+// Create a C string at `a` if the undefined bytes there form a printable,
+// NUL-terminated run. options=0 (no ALOPT_IGNHEADS) so length stops at the first
+// defined item — the run stays entirely within undefined bytes.
+bool try_make_string(ea_t a)
+{
+  if ( !is_loaded(a) )
+    return false;
+  size_t len = get_max_strlit_length(a, STRTYPE_C, 0); // stops at a defined item
+  // get_max_strlit_length ignores NAMES on undefined bytes, so truncate before
+  // any named interior location — never absorb a named address into the string.
+  for ( size_t i = 1; i < len; ++i )
+  {
+    if ( has_name(get_flags((ea_t)(a + i))) )
+    {
+      len = i;
+      break;
+    }
+  }
+  if ( len < 4 )
+    return false; // too short to be worth a string
+  return create_strlit(a, len, STRTYPE_C);
+}
+
 } // namespace
 
 EnrichStats viy_enrich(const EmuEvents &ev, const ViyConfig &cfg)
@@ -111,15 +135,21 @@ EnrichStats viy_enrich(const EmuEvents &ev, const ViyConfig &cfg)
     if ( !is_unknown(get_flags(addr)) || !in_data_seg(addr) )
       continue;                              // only ever touch undefined data
 
-    // (1) Pointer materialization: a load whose value is itself an in-image
-    // address => the slot holds a pointer. Type it and mark it an offset, which
-    // makes IDA create the dref and render "offset <target>" (vtables, fn-ptr
-    // tables). Only for reads (the DB bytes hold the pointer) of pointer width.
+    // (1) Pointer materialization: a pointer-width read of an initialized slot
+    // whose STORED value is an in-image address => the slot holds a pointer.
+    // Type it and mark it an offset, which makes IDA create the dref and render
+    // "offset <target>" (vtables, fn-ptr tables). The offset target must come
+    // from the DB bytes (that is what op_plain_offset renders), so we read the
+    // stored pointer back and validate THAT — never the emulated value, which
+    // can diverge from disk for .bss/relocated slots and would leave a bogus
+    // "offset 0". The read event (pointer-width, mapped runtime value) is only
+    // the hint that this slot is used as a pointer.
     bool did_ptr = false;
-    if ( cfg.want_ptr_refs && d.kind == RAX_MEM_READ && d.size == pbits )
+    if ( cfg.want_ptr_refs && d.kind == RAX_MEM_READ && d.size == pbits
+      && is_mapped((ea_t)d.value) && is_loaded(addr) )
     {
-      const ea_t val = (ea_t)d.value;
-      if ( val >= 0x1000 && val != addr && is_mapped(val) )
+      const ea_t stored = pbits == 8 ? (ea_t)get_qword(addr) : (ea_t)get_dword(addr);
+      if ( stored >= 0x1000 && stored != addr && is_mapped(stored) )
       {
         const bool typed = pbits == 8 ? create_qword(addr, 8) : create_dword(addr, 4);
         if ( typed && op_plain_offset(addr, 0, 0) )
@@ -129,18 +159,21 @@ EnrichStats viy_enrich(const EmuEvents &ev, const ViyConfig &cfg)
           if ( cfg.want_comments )
           {
             qstring txt;
-            txt.sprnt("viy: %s -> %s", ea_label(addr).c_str(), ea_label(val).c_str());
+            txt.sprnt("viy: %s -> %s", ea_label(addr).c_str(), ea_label(stored).c_str());
             add_rpt_comment(from, txt.c_str());
           }
         }
       }
     }
 
-    // (2) Otherwise, give the undefined global a data type matching the access
+    // (2) Otherwise, if the undefined bytes look like a C string, create one;
+    // failing that, give the undefined global a data type matching the access
     // size, so the listing shows a sized item instead of raw bytes.
-    if ( !did_ptr && cfg.want_data_types )
+    if ( !did_ptr )
     {
-      if ( type_scalar(addr, d.size) )
+      if ( cfg.want_strings && try_make_string(addr) )
+        ++st.strings;
+      else if ( cfg.want_data_types && type_scalar(addr, d.size) )
         ++st.typed;
     }
   }

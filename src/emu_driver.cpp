@@ -39,6 +39,7 @@ struct HookCtx
   uint64_t   prev_pc = 0, last_pc = 0;
   uint32_t   prev_size = 0;
   bool       has_prev = false;
+  bool       record_pcs = false; // populate out->exec_pcs (opaque-predicate analysis)
   size_t     edge_cap = 0, data_cap = 0;
 };
 
@@ -60,6 +61,8 @@ void code_tr(rax_engine *, uint64_t addr, uint32_t size, void *user)
       c->out->edges.push_back(ExecEdge{ c->prev_pc, addr });
     }
   }
+  if ( c->record_pcs && c->out->exec_pcs.size() < c->edge_cap )
+    c->out->exec_pcs.insert(addr);
   c->prev_pc = addr;
   c->prev_size = size;
   c->has_prev = true;
@@ -130,6 +133,23 @@ EmuDriver::EmuDriver(const RaxApi *api, const ProgramImage &img)
   if ( !arch_params(img_.arch, img_.big_endian, rax_arch, mode, sp, fp, lr, is64) )
     return;
   sp_reg_ = sp; fp_reg_ = fp; lr_reg_ = lr;
+
+  // Integer argument registers, for multi-run seed variation (opaque-predicate
+  // analysis). Empty where args are stack-passed (x86-32) or the arch isn't
+  // driven for discovery.
+  switch ( img_.arch )
+  {
+    case ViyArch::X86_64:
+      arg_regs_ = { RAX_X86_REG_RDI, RAX_X86_REG_RSI, RAX_X86_REG_RDX,
+                    RAX_X86_REG_RCX, RAX_X86_REG_R8,  RAX_X86_REG_R9 };
+      break;
+    case ViyArch::ARM64:
+      for ( int i = 0; i < 8; ++i )
+        arg_regs_.push_back(RAX_ARM64_X(i));
+      break;
+    default:
+      break;
+  }
 
   // Choose a scratch stack region that does not intersect the image. This region
   // doubles as the engine's initial (default) mapping, so it never collides with
@@ -306,6 +326,19 @@ void EmuDriver::save_baseline()
   baseline_ok_ = true;
 }
 
+void EmuDriver::seed_arg_regs(uint64_t seed)
+{
+  // Write small, varied scalar values into the integer argument registers so
+  // repeated runs take different conditional-branch directions. Kept small to
+  // vary comparisons without immediately faulting on a wild pointer deref.
+  uint64_t x = seed * 0x9E3779B97F4A7C15ull + 0x1234567u;
+  for ( int r : arg_regs_ )
+  {
+    x ^= x >> 33; x *= 0xFF51AFD7ED558CCDull; x ^= x >> 33;
+    api_->reg_write_u64(engine_, r, x & 0xFFFFu);
+  }
+}
+
 void EmuDriver::restore_state()
 {
   // Restore the clean baseline (memory + registers) before each run so per-run
@@ -315,7 +348,8 @@ void EmuDriver::restore_state()
   api_->context_restore(engine_, baseline_.data(), baseline_.size());
 }
 
-bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig &cfg, EmuEvents &out)
+bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig &cfg, EmuEvents &out,
+                             EmuOutcome *outcome, bool record_pcs, uint64_t seed)
 {
   if ( !can_discover() )
     return false;
@@ -327,6 +361,7 @@ bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig 
   uint64_t sp = (stack_base_ + stack_size_ - 0x400) & ~align;
   if ( img_.arch == ViyArch::X86_64 )
     sp |= 0x8; // x86-64 ABI: rsp%16 == 8 at entry (after the call pushed retaddr)
+  const uint64_t sp_entry = sp;
 
   if ( sp_reg_ >= 0 )
     api_->reg_write_u64(engine_, sp_reg_, sp);
@@ -349,12 +384,16 @@ bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig 
     api_->mem_write(engine_, sp, buf, ptr);
   }
 
+  if ( seed != 0 )
+    seed_arg_regs(seed); // vary conditional-branch directions across runs
+
   HookCtx ctx;
   ctx.out = &out;
   ctx.lo = img_.lo;
   ctx.hi = img_.hi;
   ctx.flo = entry;
   ctx.fhi = func_end > entry ? func_end : img_.hi;
+  ctx.record_pcs = record_pcs;
   ctx.edge_cap = (size_t)cfg.max_insns;
   ctx.data_cap = (size_t)cfg.max_insns;
 
@@ -373,6 +412,28 @@ bool EmuDriver::emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig 
   {
     const uint64_t timeout_us = cfg.timeout_ms * 1000ull;
     api_->emu_start(engine_, entry, sentinel_, timeout_us, cfg.max_insns);
+  }
+
+  // Summarize the run for the function-level analyses (purge / no-return).
+  if ( code_ok && outcome != nullptr )
+  {
+    rax_exit ex;
+    std::memset(&ex, 0, sizeof(ex));
+    if ( api_->emu_last_exit(engine_, &ex) == RAX_OK )
+    {
+      outcome->stop_reason = ex.reason;
+      outcome->stop_pc = ex.address;
+      outcome->returned = ex.reason == RAX_STOP_UNTIL; // reached the sentinel
+    }
+    if ( outcome->returned && sp_reg_ >= 0 )
+    {
+      uint64_t sp_final = 0;
+      if ( api_->reg_read_u64(engine_, sp_reg_, &sp_final) == RAX_OK )
+      {
+        outcome->sp_delta = (int64_t)(sp_final - sp_entry);
+        outcome->sp_valid = true;
+      }
+    }
   }
 
   if ( code_ok ) api_->hook_del(engine_, code_id);

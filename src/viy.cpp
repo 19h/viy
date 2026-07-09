@@ -11,6 +11,8 @@
  * be driven, viy does nothing at all — no dialogs, no errors, at most a single
  * summary line when it actually found something.
  */
+#include <unordered_set>
+
 #include <pro.h>
 #include <idp.hpp>
 #include <loader.hpp>
@@ -24,6 +26,7 @@
 #include "ref_discovery.hpp"
 #include "static_decoder.hpp"
 #include "enrich.hpp"
+#include "advanced.hpp"
 
 using namespace viy;
 
@@ -52,6 +55,7 @@ struct viy_t : public plugmod_t
   RefStats stats;          // from the emulation (indirect) pass
   RefStats sstats;         // from the static-decode (direct) pass
   EnrichStats estats;      // from the value-derived enrichment pass
+  AdvStats astats;         // from the function-level advanced analyses
   bool started = false;
 
   viy_t();
@@ -153,6 +157,7 @@ void viy_t::on_analysis_done()
   stats = RefStats{};
   sstats = RefStats{};
   estats = EnrichStats{};
+  astats = AdvStats{};
   start_sweep();
 }
 
@@ -180,8 +185,25 @@ bool viy_t::process_batch(int count)
     // Dynamic pass: emulate to resolve INDIRECT control flow + data refs.
     // (drv is null when the backend can't discover; the static pass still runs.)
     EmuEvents ev;
+    EmuOutcome outcome;
+    std::unordered_set<uint64_t> reached;
     if ( drv != nullptr )
-      drv->emulate_from(fstart, fend, cfg, ev);
+    {
+      drv->emulate_from(fstart, fend, cfg, ev, &outcome, cfg.want_opaque, /*seed=*/0);
+      if ( cfg.want_opaque )
+      {
+        // Extra runs with varied inputs to gauge which branch sides are
+        // reachable (opaque-predicate hints).
+        reached.insert(ev.exec_pcs.begin(), ev.exec_pcs.end());
+        for ( int k = 1; k < cfg.opaque_runs; ++k )
+        {
+          EmuEvents ev2;
+          drv->emulate_from(fstart, fend, cfg, ev2, nullptr, /*record_pcs=*/true,
+                            (uint64_t)k * 2654435761u + 1u);
+          reached.insert(ev2.exec_pcs.begin(), ev2.exec_pcs.end());
+        }
+      }
+    }
     RefStats s = viy_apply_missing(ev, cfg);
     stats.crefs += s.crefs;
     stats.drefs += s.drefs;
@@ -192,7 +214,33 @@ bool viy_t::process_batch(int count)
     EnrichStats en = viy_enrich(ev, cfg);
     estats.ptr_refs += en.ptr_refs;
     estats.typed    += en.typed;
+    estats.strings  += en.strings;
     estats.comments += en.comments;
+
+    // No-return needs corroboration: only when the natural (seed 0) run halted
+    // without returning do we spend a few varied-input runs to confirm that NO
+    // input path returns — a single zero-argument run is never trusted.
+    bool noret_corroborated = false;
+    if ( drv != nullptr && (cfg.want_noret || cfg.set_noret)
+      && !outcome.returned
+      && (outcome.stop_reason == RAX_STOP_HLT || outcome.stop_reason == RAX_STOP_SHUTDOWN) )
+    {
+      bool any_return = false;
+      for ( int k = 1; k <= 4 && !any_return; ++k )
+      {
+        EmuEvents evx;
+        EmuOutcome ox;
+        drv->emulate_from(fstart, fend, cfg, evx, &ox, /*record_pcs=*/false,
+                          (uint64_t)k * 0x9E3779B1u + 7u);
+        if ( ox.returned )
+          any_return = true;
+      }
+      noret_corroborated = !any_return;
+    }
+
+    // Advanced: switch reconstruction, stack purge, no-return / arg-reg /
+    // opaque-predicate hints.
+    viy_advanced(img.arch, fstart, fend, ev, outcome, reached, noret_corroborated, cfg, astats);
 
     // Static pass: rax's decoder recovers any DIRECT targets IDA missed.
     if ( cfg.want_static )
@@ -211,15 +259,23 @@ void viy_t::finish()
   const unsigned long long drefs = (unsigned long long)stats.drefs;
   const unsigned long long ptrs  = (unsigned long long)estats.ptr_refs;
   const unsigned long long typed = (unsigned long long)estats.typed;
+  const unsigned long long strs  = (unsigned long long)estats.strings;
   const unsigned long long cmts  = (unsigned long long)estats.comments;
-  if ( ind_c != 0 || dir_c != 0 || drefs != 0 || ptrs != 0 || typed != 0 || cmts != 0 )
+  const unsigned long long sw    = (unsigned long long)astats.switches;
+  const unsigned long long pg    = (unsigned long long)astats.purges;
+  const unsigned long long nr    = (unsigned long long)astats.norets;
+  const unsigned long long ar    = (unsigned long long)astats.argregs;
+  const unsigned long long op    = (unsigned long long)astats.opaque;
+  if ( ind_c || dir_c || drefs || ptrs || typed || strs || cmts || sw || pg || nr || ar || op )
   {
     const char *rv = (api != nullptr && api->version_string != nullptr)
                    ? api->version_string() : "?";
     msg("viy: %llu code xref(s) [%llu indirect, %llu direct], %llu data xref(s), "
-        "%llu pointer(s), %llu typed global(s), %llu comment(s) "
-        "across %llu function(s) [rax %s]\n",
-        ind_c + dir_c, ind_c, dir_c, drefs, ptrs, typed, cmts,
+        "%llu ptr, %llu typed, %llu string(s); "
+        "%llu switch(es), %llu purge(s), %llu noret, %llu argregs, %llu opaque; "
+        "%llu comment(s) across %llu function(s) [rax %s]\n",
+        ind_c + dir_c, ind_c, dir_c, drefs, ptrs, typed, strs,
+        sw, pg, nr, ar, op, cmts,
         (unsigned long long)funcs_done, rv);
   }
   // Found nothing => say nothing.

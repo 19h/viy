@@ -53,6 +53,18 @@ ViyConfig viy_load_config()
   c.want_ptr_refs   = env_bool("VIY_PTR_REFS", c.want_ptr_refs);
   c.want_data_types = env_bool("VIY_TYPE_DATA", c.want_data_types);
   c.want_comments   = env_bool("VIY_COMMENTS", c.want_comments);
+  c.want_strings    = env_bool("VIY_STRINGS", c.want_strings);
+  c.want_switch     = env_bool("VIY_SWITCH", c.want_switch);
+  c.want_purge      = env_bool("VIY_PURGE", c.want_purge);
+  c.want_noret      = env_bool("VIY_NORET", c.want_noret);
+  c.set_noret       = env_bool("VIY_SET_NORET", c.set_noret);
+  c.want_argregs    = env_bool("VIY_ARGREGS", c.want_argregs);
+  c.want_opaque     = env_bool("VIY_OPAQUE", c.want_opaque);
+  c.opaque_runs     = (int)env_u64("VIY_OPAQUE_RUNS", (uint64_t)c.opaque_runs);
+  if ( c.opaque_runs < 2 )
+    c.opaque_runs = 2;
+  if ( c.opaque_runs > 16 )
+    c.opaque_runs = 16;
 
   if ( c.funcs_per_tick < 1 )
     c.funcs_per_tick = 1;

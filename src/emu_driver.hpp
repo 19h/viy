@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_set>
 #include <vector>
 
 #include "rax_loader.hpp"
@@ -45,6 +46,20 @@ struct EmuEvents
 {
   std::vector<ExecEdge> edges;
   std::vector<DataAcc>  data;
+  // Distinct instruction addresses executed this run (populated only when the
+  // caller asks for it — see EmuDriver::emulate_from `record_pcs`). Used for
+  // opaque-predicate / dead-branch analysis (which successors were reachable).
+  std::unordered_set<uint64_t> exec_pcs;
+};
+
+// Post-run summary of a single emulation, for the function-level analyses.
+struct EmuOutcome
+{
+  int      stop_reason = 0;    // RAX_STOP_* from rax_emu_last_exit
+  uint64_t stop_pc = 0;        // PC at stop
+  bool     returned = false;   // reached the sentinel return address (function returned)
+  bool     sp_valid = false;   // sp_delta is meaningful (returned + SP readable)
+  int64_t  sp_delta = 0;       // final SP - entry SP (net stack change on return)
 };
 
 class EmuDriver
@@ -70,7 +85,8 @@ public:
   // executed under this function's fabricated state do not contribute noise —
   // each function is mined from its own entry. Bounded by instruction count and
   // wall-clock timeout; faults are contained. Returns true if emulation ran.
-  bool emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig &cfg, EmuEvents &out);
+  bool emulate_from(uint64_t entry, uint64_t func_end, const ViyConfig &cfg, EmuEvents &out,
+                    EmuOutcome *outcome = nullptr, bool record_pcs = false, uint64_t seed = 0);
 
 private:
   bool map_image();
@@ -78,6 +94,7 @@ private:
   void load_image_bytes();
   void save_baseline();
   void restore_state();
+  void seed_arg_regs(uint64_t seed); // perturb GP/arg registers for multi-run variation
 
   const RaxApi     *api_ = nullptr;
   const ProgramImage &img_;
@@ -89,6 +106,7 @@ private:
   int      sp_reg_ = -1;   // stack-pointer register id
   int      fp_reg_ = -1;   // frame-pointer register id (-1 if none)
   int      lr_reg_ = -1;   // link register id (-1 => return address is on stack)
+  std::vector<int> arg_regs_; // integer argument registers (for multi-run seeding)
   uint64_t stack_base_ = 0;
   uint64_t stack_size_ = 0;
   uint64_t sentinel_ = 0;  // "returned out of the function" stop address

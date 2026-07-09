@@ -40,6 +40,7 @@ namespace viy {
   X(mem_write,                rax_mem_write)                 \
   /* registers */                                            \
   X(reg_write_u64,            rax_reg_write_u64)             \
+  X(reg_read_u64,             rax_reg_read_u64)              \
   /* execution control */                                    \
   X(emu_start,                rax_emu_start)                 \
   X(emu_stop,                 rax_emu_stop)                  \

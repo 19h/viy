@@ -13,10 +13,21 @@ complementary passes run per function:
   (which static analysis cannot recover) into IDA annotations: in-image pointers
   loaded from memory become typed `offset` data (surfacing vtables and
   function-pointer tables), undefined globals get a data type matching the
-  observed access size, and resolved indirect targets get repeatable comments.
+  observed access size, C strings are created at string reads, and resolved
+  indirect targets get repeatable comments;
+- an **advanced** pass with function-level analyses: it reconstructs **switches**
+  from an indirect jump's resolved targets, sets a callee's **stack purge** from
+  the emulated SP delta, and hints **no-return** functions, inferred **argument
+  registers**, and **opaque predicates / dead branches**.
 
 Everything it finds is checked against the existing database and only genuinely
 missing/undefined items are added — viy only ever *adds*, never overwrites.
+Verifiable results (strings, purge) are applied directly; inferences that can't
+be proven from unattended emulation are emitted as clearly-labelled comments by
+default, so viy stays "never wrong": no-return requires several varied-input
+runs to agree, arg-registers and opaque-predicate findings are comments, and the
+DB-mutating knobs are opt-in — `VIY_SWITCH=1` (partial-coverage switches),
+`VIY_OPAQUE=1`, and `VIY_SET_NORET=1` (set `FUNC_NORET`).
 
 It is designed to be **as transparent and invisible as possible**:
 
@@ -115,7 +126,15 @@ All optional; sensible defaults otherwise. Set these before launching IDA.
 | `VIY_STATIC`         | `1`      | Run the rax static-decode pass (needs rax ≥ 1.2).  |
 | `VIY_PTR_REFS`       | `1`      | Materialize in-image pointers loaded from memory.  |
 | `VIY_TYPE_DATA`      | `1`      | Type undefined globals by observed access size.    |
+| `VIY_STRINGS`        | `1`      | Detect + create C strings at observed data reads.  |
 | `VIY_COMMENTS`       | `1`      | Add comments naming what rax resolved.             |
+| `VIY_SWITCH`         | `0`      | Reconstruct switches (opt-in; coverage may be partial).|
+| `VIY_PURGE`          | `1`      | Set callee stack purge (x86) from the SP delta.    |
+| `VIY_NORET`          | `1`      | Comment-hint no-return functions.                  |
+| `VIY_SET_NORET`      | `0`      | Actually set `FUNC_NORET` (opt-in; re-flows callers).|
+| `VIY_ARGREGS`        | `1`      | Comment-hint inferred argument registers.          |
+| `VIY_OPAQUE`         | `0`      | Multi-run opaque-predicate / dead-branch hints.    |
+| `VIY_OPAQUE_RUNS`    | `3`      | Emulation runs used for opaque detection.          |
 | `VIY_RAX_PATH`       | —        | Explicit path to librax.                           |
 
 ## Scope & limitations

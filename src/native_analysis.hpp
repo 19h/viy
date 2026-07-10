@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <variant>
@@ -30,6 +31,13 @@ enum class NativeArchitecture : uint8_t
   X86,
   Arm32,
   Arm64,
+};
+
+enum class NativeCapabilityState : uint8_t
+{
+  Unknown = 0,
+  Available,
+  Unavailable,
 };
 
 enum class NativeEvidenceSource : uint8_t
@@ -279,6 +287,26 @@ private:
   std::string last_error_;
 };
 
+enum class NativeAnalysisProgressStage : uint8_t
+{
+  FUNCTIONS = 0,
+  UNOWNED_CODE,
+  COMPLETE,
+};
+
+struct NativeAnalysisProgress
+{
+  NativeAnalysisProgressStage stage = NativeAnalysisProgressStage::FUNCTIONS;
+  size_t functions_completed = 0;
+  size_t functions_total = 0;
+  size_t instructions_scanned = 0;
+  size_t facts_emitted = 0;
+  bool stage_boundary = false;
+};
+
+using NativeAnalysisProgressCallback =
+    std::function<void(const NativeAnalysisProgress &)>;
+
 struct NativeAnalysisOptions
 {
   bool resolve_indirect_control_flow = true;
@@ -305,6 +333,14 @@ struct NativeAnalysisOptions
   // values are rejected rather than acquiring version-specific behavior.
   int regfinder_max_depth = 0;
   uint32_t flag_scan_depth = 8;
+
+  // Observability only: no callback field affects fact semantics. Function and
+  // stage boundaries are always reported; within a large function/unowned
+  // range this interval bounds callback overhead. Zero disables intra-function
+  // callbacks. The callback runs synchronously on the main thread and must not
+  // mutate the IDB.
+  size_t progress_instruction_interval = 256;
+  NativeAnalysisProgressCallback progress;
 };
 
 struct NativeAnalysisStats
@@ -323,7 +359,12 @@ struct NativeAnalysisStats
   size_t known_flag_branches = 0;
   size_t function_candidates = 0;
   size_t decode_discrepancies = 0;
-  bool regfinder_supported = true;
+  // Register-value lookup is known only after find_reg_value_info() is called;
+  // operand-address lookup is independently exposed by PH.get_regfinder().
+  // Keeping them separate prevents partial support from becoming a false
+  // binary capability claim.
+  NativeCapabilityState register_tracker = NativeCapabilityState::Unknown;
+  NativeCapabilityState operand_address_tracker = NativeCapabilityState::Unknown;
 };
 
 // One provider must be owned by one IDB/plugmod instance.  There is no global

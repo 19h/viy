@@ -9,7 +9,9 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "viy_config.hpp"
@@ -144,7 +146,43 @@ uint64_t viy_program_content_hash(const ProgramImage &img);
 // false (out set to UNSUPPORTED) for anything viy cannot identify safely.
 bool viy_detect_arch(ViyArch &arch_out, bool &big_endian_out);
 
-// Snapshot segments + function entries into `img`. Main thread only.
-void viy_snapshot(ProgramImage &img, const ViyConfig &cfg);
+enum class ProgramSnapshotStage : uint8_t
+{
+  SEGMENTS = 0,
+  FUNCTIONS,
+  COMPLETE,
+};
+
+struct ProgramSnapshotStats
+{
+  size_t segments_total = 0;
+  size_t segments_visited = 0;
+  size_t segments_copied = 0;
+  size_t segments_invalid = 0;
+  size_t segments_read_failed = 0;
+  size_t functions_total = 0;
+  size_t functions_visited = 0;
+  size_t functions_included = 0;
+  size_t functions_null = 0;
+  size_t functions_library_or_thunk = 0;
+  size_t functions_excluded_by_limit = 0;
+  size_t chunks_included = 0;
+};
+
+struct ProgramSnapshotProgress
+{
+  ProgramSnapshotStage stage = ProgramSnapshotStage::SEGMENTS;
+  ProgramSnapshotStats stats;
+};
+
+using ProgramSnapshotProgressCallback =
+    std::function<void(const ProgramSnapshotProgress &)>;
+
+// Snapshot segments + function entries into `img`. Main thread only. The
+// optional callback receives exact monotonic counters after each visited
+// segment/function plus stage boundaries; it must not mutate the IDB.
+ProgramSnapshotStats viy_snapshot(
+    ProgramImage &img, const ViyConfig &cfg,
+    const ProgramSnapshotProgressCallback &progress = {});
 
 } // namespace viy

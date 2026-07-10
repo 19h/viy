@@ -520,6 +520,47 @@ The plug-in-level `started` flag makes the sweep once-per-IDB-lifetime apart
 from these internal epochs. There is not yet a user-facing incremental rescan
 command.
 
+## Runtime observability
+
+The plugin emits stable, single-line `[viy]` key/value records from the main
+thread. Immediate records describe lifecycle transitions, capabilities,
+provider results, evidence application, persistence, and completion. Periodic
+records sample the current epoch's completed/total functions, worker
+availability, queued/running/ready jobs, cumulative result taxonomy, run counts,
+cache hits, evidence records, mutation operations, and monotonic elapsed time.
+Snapshot, native-provider, structural-provider, and evidence-application
+callbacks additionally expose bounded intra-phase progress. Snapshot accounting
+is exhaustive across copied/invalid/read-failed segments and
+included/null/library-or-thunk/limit-excluded functions.
+
+Worker diagnostics cross the thread boundary only inside ordered result values.
+The owner aggregates at most eight distinct, bounded messages and does not call
+IDA output APIs from worker threads. Cache hits and native/static-only passes
+are accounted separately from actual unavailable worker results. Worker gauges
+are sampled before pool destruction. Diagnostic configuration is excluded from
+the semantic job fingerprint and evidence model. Pool construction is never
+reported as successful dynamic capability: initialization resolves through
+`initializing` to `available`, `partial`, or `unavailable`. Register-value
+tracking and operand-address tracking remain separate tri-state capabilities.
+
+`VIY_LOG_LEVEL=0..3` selects quiet, lifecycle, progress, or per-function trace
+output. Progress defaults to one record per 1000 ms and is clamped to a cadence
+of 100–60000 ms. Phase/terminal records bypass that cadence. Manual invocation
+prints the current immutable status projection through the same formatter.
+Manual invocation cannot bypass the final-autoanalysis boundary, and terminal
+elapsed time is frozen before any later status projection.
+
+Automatic evidence application does not materialize the full set of
+Variation/Ambiguity conflicts. `contradicted_payload_digests()` indexes only
+contradiction-capable subjects and overlapping code regions, hashes only actual
+participants, and returns the exact suppression set. Its complexity is
+`O(n log n + p)`, where `n` is the canonical record count and `p` contains only
+contradiction-capable relations/overlapping-region pairs. Exhaustive
+`detect_conflicts()` remains available for audit consumers; it caches each
+canonical payload digest once and avoids copying the record ledger. Restore and
+recovery paths do not compute exhaustive conflict counts when the report is
+discarded.
+
 ## Decoder core
 
 `decoder_core.*` is the IDA-free policy shared by direct-target recovery and the

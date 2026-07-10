@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -480,6 +481,45 @@ void test_ambiguity_and_variation_do_not_suppress()
                   "second variation remains a retained non-action payload");
 }
 
+void test_high_cardinality_variation_fast_path()
+{
+  EvidenceStore store;
+  constexpr size_t count = 2048;
+  for (size_t i = 0; i < count; ++i)
+  {
+    RegisterValueFact value;
+    value.instruction = 0xf000;
+    value.point = RegisterStatePoint::BeforeInstruction;
+    value.register_id = "x0";
+    value.bytes = {static_cast<uint8_t>(i & 0xffu),
+                   static_cast<uint8_t>((i >> 8u) & 0xffu)};
+    add(store, value,
+        evidence(ProofKind::Observed, kMaxConfidence,
+                 static_cast<uint64_t>(i + 1), static_cast<uint64_t>(i + 1)),
+        "high-cardinality register variation is accepted");
+  }
+
+  ContradictionScanStats scan;
+  const std::set<FactDigest> contradicted =
+      store.contradicted_payload_digests(&scan);
+  expect(contradicted.empty(),
+         "register-value variation never becomes a contradiction");
+  expect(scan.records_indexed == count,
+         "fast contradiction scan indexes the high-cardinality fixture");
+  expect(scan.candidate_relations_examined == 0,
+         "variation-only buckets generate zero contradiction pair checks");
+  expect(scan.payload_digests_computed == 0,
+         "variation-only buckets generate zero contradiction digests");
+
+  const EvidenceApplyPlan plan = plan_evidence_application(store);
+  expect(plan.decisions.size() == count,
+         "fast application planning retains one decision per variation record");
+  expect(plan.contradiction_suppressed == 0 &&
+         plan.contradiction_scan.candidate_relations_examined == 0 &&
+         plan.contradiction_scan.payload_digests_computed == 0,
+         "application planner uses the contradiction-only fast path");
+}
+
 } // namespace
 
 int main()
@@ -492,6 +532,7 @@ int main()
   test_branch_state_and_comment_gate();
   test_contradiction_suppression();
   test_ambiguity_and_variation_do_not_suppress();
+  test_high_cardinality_variation_fast_path();
 
   if (failures != 0)
   {

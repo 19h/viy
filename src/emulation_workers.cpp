@@ -339,13 +339,20 @@ EmulationWorkerPool::EmulationWorkerPool(size_t worker_count,
   }
   catch ( ... )
   {
-    // Thread resource exhaustion degrades to the workers already created. The
-    // pool remains usable when at least one exists and reports the actual count.
+    // Thread resource exhaustion degrades to the workers already created while
+    // retaining the requested count. Missing threads are settled as unavailable
+    // initialization attempts so capability reporting cannot remain stuck in
+    // an "initializing" state or incorrectly report the pool as disabled.
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->requested_workers = impl_->threads.size();
-    if ( impl_->requested_workers == 0 )
+    const size_t created = impl_->threads.size();
+    const size_t missing = impl_->requested_workers > created
+                         ? impl_->requested_workers - created : 0;
+    impl_->initialized_workers += missing;
+    impl_->unavailable_workers += missing;
+    if ( missing != 0 && impl_->first_unavailable_reason.empty() )
+      impl_->first_unavailable_reason = "worker thread creation failed";
+    if ( created == 0 )
     {
-      impl_->first_unavailable_reason = "no worker thread could be created";
       impl_->drain_queued_locked(EmulationJobStatus::UNAVAILABLE,
                                  impl_->first_unavailable_reason.c_str());
     }
@@ -512,6 +519,12 @@ EmulationWorkerStats EmulationWorkerPool::stats() const
   result.ready_in_order_or_later = impl_->completed.size();
   result.stopping = impl_->stopping;
   return result;
+}
+
+std::string EmulationWorkerPool::initialization_diagnostic() const
+{
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->first_unavailable_reason;
 }
 
 } // namespace viy

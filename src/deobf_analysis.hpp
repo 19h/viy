@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -71,6 +72,26 @@ private:
   uint64_t active_generation_ = 0;
 };
 
+enum class DeobfAnalysisProgressStage : uint8_t
+{
+  FUNCTIONS = 0,
+  COMPLETE,
+};
+
+struct DeobfAnalysisProgress
+{
+  DeobfAnalysisProgressStage stage = DeobfAnalysisProgressStage::FUNCTIONS;
+  size_t functions_completed = 0;
+  size_t functions_total = 0;
+  size_t instructions_scanned = 0;
+  size_t blocks_scanned = 0;
+  size_t facts_emitted = 0;
+  bool stage_boundary = false;
+};
+
+using DeobfAnalysisProgressCallback =
+    std::function<void(const DeobfAnalysisProgress &)>;
+
 struct DeobfAnalysisOptions
 {
   bool detect_get_pc_gadgets = true;
@@ -88,6 +109,10 @@ struct DeobfAnalysisOptions
   size_t max_instructions_per_function = 4096;
   size_t max_blocks_per_function = 1024;
   deobf::ClassifierLimits classifier_limits;
+
+  // Observability only. Invoked synchronously after each deterministic
+  // function position and at phase boundaries; it must not mutate the IDB.
+  DeobfAnalysisProgressCallback progress;
 };
 
 struct DeobfAnalysisStats

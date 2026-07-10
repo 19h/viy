@@ -1088,6 +1088,44 @@ struct NativeAnalysisProvider::Impl
   NativeArchitecture arch = NativeArchitecture::Unsupported;
   std::unordered_map<uint64_t, KeySet> emitted_by_function;
 
+  struct ProgressContext
+  {
+    const NativeAnalysisOptions *options = nullptr;
+    NativeAnalysisProgressStage stage = NativeAnalysisProgressStage::FUNCTIONS;
+    size_t functions_completed = 0;
+    size_t functions_total = 0;
+    size_t last_instructions = 0;
+  };
+
+  void report_progress(
+      ProgressContext *progress,
+      const NativeAnalysisStats &stats,
+      bool stage_boundary,
+      bool force = false) const
+  {
+    if ( progress == nullptr || progress->options == nullptr
+      || !progress->options->progress )
+    {
+      return;
+    }
+    const size_t interval = progress->options->progress_instruction_interval;
+    const size_t delta = stats.instructions_scanned >= progress->last_instructions
+                       ? stats.instructions_scanned - progress->last_instructions
+                       : 0;
+    if ( !force && !stage_boundary && (interval == 0 || delta < interval) )
+      return;
+
+    NativeAnalysisProgress event;
+    event.stage = progress->stage;
+    event.functions_completed = progress->functions_completed;
+    event.functions_total = progress->functions_total;
+    event.instructions_scanned = stats.instructions_scanned;
+    event.facts_emitted = stats.facts_emitted;
+    event.stage_boundary = stage_boundary;
+    progress->options->progress(event);
+    progress->last_instructions = stats.instructions_scanned;
+  }
+
   NativeFactProvenance provenance(
       const ScanContext &ctx,
       NativeEvidenceSource source,
@@ -1279,13 +1317,11 @@ struct NativeAnalysisProvider::Impl
     if ( reg >= 0 )
     {
       reg_value_info_t rvi;
-      if ( !find_reg_value_info(
+      if ( find_reg_value_info(
               &rvi, insn.ea, reg, options.regfinder_max_depth) )
       {
-        stats.regfinder_supported = false;
-      }
-      else
-      {
+        if ( stats.register_tracker == NativeCapabilityState::Unknown )
+          stats.register_tracker = NativeCapabilityState::Available;
         uval_t value = BADADDR;
         if ( rvi.get_num(&value) )
         {
@@ -1298,6 +1334,13 @@ struct NativeAnalysisProvider::Impl
                      width, std::numeric_limits<uint8_t>::max())));
         }
       }
+      else
+      {
+        // Public SDK contract: false means that the processor module does not
+        // support register tracking. Unknown/varying values return true with
+        // the corresponding reg_value_info_t state.
+        stats.register_tracker = NativeCapabilityState::Unavailable;
+      }
     }
 
     if ( memory_operand == nullptr )
@@ -1305,7 +1348,7 @@ struct NativeAnalysisProvider::Impl
     reg_finder_t *finder = PH.get_regfinder();
     if ( finder == nullptr )
     {
-      stats.regfinder_supported = false;
+      stats.operand_address_tracker = NativeCapabilityState::Unavailable;
       return;
     }
 
@@ -1639,7 +1682,8 @@ struct NativeAnalysisProvider::Impl
       const ScanContext &ctx,
       const NativeAnalysisOptions &options,
       size_t *function_instruction_count,
-      size_t instruction_limit)
+      size_t instruction_limit,
+      ProgressContext *progress)
   {
     ++stats.chunks_scanned;
     ea_t ea = ctx.chunk_start;
@@ -1678,6 +1722,7 @@ struct NativeAnalysisProvider::Impl
                  fact);
           }
         }
+        report_progress(progress, stats, false);
       }
 
       const ea_t next = next_head(ea, ctx.chunk_end);
@@ -1690,7 +1735,8 @@ struct NativeAnalysisProvider::Impl
   bool scan_function(
       NativeAnalysisStats &stats,
       func_t *pfn,
-      const NativeAnalysisOptions &options)
+      const NativeAnalysisOptions &options,
+      ProgressContext *progress)
   {
     if ( pfn == nullptr || pfn->start_ea == BADADDR )
       return false;
@@ -1704,20 +1750,31 @@ struct NativeAnalysisProvider::Impl
         continue;
       ScanContext ctx{ pfn->start_ea, range.start_ea, range.end_ea };
       scan_chunk(stats, ctx, options, &instruction_count,
-                 options.max_instructions_per_function);
+                 options.max_instructions_per_function, progress);
       if ( options.max_instructions_per_function != 0
         && instruction_count >= options.max_instructions_per_function )
       {
         break;
       }
     }
+    if ( progress != nullptr )
+    {
+      ++progress->functions_completed;
+      report_progress(progress, stats, false, true);
+    }
     return true;
   }
 
   void scan_unowned_code(
       NativeAnalysisStats &stats,
-      const NativeAnalysisOptions &options)
+      const NativeAnalysisOptions &options,
+      ProgressContext *progress)
   {
+    if ( progress != nullptr )
+    {
+      progress->stage = NativeAnalysisProgressStage::UNOWNED_CODE;
+      report_progress(progress, stats, true, true);
+    }
     size_t total = 0;
     const int count = get_segm_qty();
     for ( int i = 0; i < count; ++i )
@@ -1735,6 +1792,7 @@ struct NativeAnalysisProvider::Impl
         if ( options.max_unowned_instructions != 0
           && total >= options.max_unowned_instructions )
         {
+          report_progress(progress, stats, false, true);
           return;
         }
         const flags64_t flags = get_flags(ea);
@@ -1748,6 +1806,7 @@ struct NativeAnalysisProvider::Impl
             inspect_instruction(stats, ctx, insn, options);
           else
             ++stats.decode_failures;
+          report_progress(progress, stats, false);
         }
         const ea_t next = next_head(ea, seg->end_ea);
         if ( next == BADADDR || next <= ea )
@@ -1755,6 +1814,7 @@ struct NativeAnalysisProvider::Impl
         ea = next;
       }
     }
+    report_progress(progress, stats, false, true);
   }
 
   NativeAnalysisStats make_stats()
@@ -1763,6 +1823,12 @@ struct NativeAnalysisProvider::Impl
     NativeAnalysisStats stats;
     stats.architecture = arch;
     stats.epoch = current_epoch;
+    if ( arch != NativeArchitecture::Unsupported )
+    {
+      stats.operand_address_tracker = PH.get_regfinder() == nullptr
+                                    ? NativeCapabilityState::Unavailable
+                                    : NativeCapabilityState::Available;
+    }
     return stats;
   }
 };
@@ -1781,7 +1847,16 @@ NativeAnalysisStats NativeAnalysisProvider::analyze_database(
 {
   NativeAnalysisStats stats = impl_->make_stats();
   if ( impl_->arch == NativeArchitecture::Unsupported )
+  {
+    if ( options.progress )
+    {
+      NativeAnalysisProgress progress;
+      progress.stage = NativeAnalysisProgressStage::COMPLETE;
+      progress.stage_boundary = true;
+      options.progress(progress);
+    }
     return stats;
+  }
 
   // Snapshot entries before invoking a sink.  The sink contract forbids IDB
   // mutation, but this also makes enumeration robust against unrelated queued
@@ -1799,14 +1874,26 @@ NativeAnalysisStats NativeAnalysisProvider::analyze_database(
       entries.push_back(pfn->start_ea);
   }
 
+  Impl::ProgressContext progress;
+  progress.options = &options;
+  progress.functions_total = entries.size();
+  impl_->report_progress(&progress, stats, true, true);
+
   for ( ea_t entry : entries )
   {
     func_t *pfn = get_func(entry);
     if ( pfn != nullptr && pfn->start_ea == entry )
-      impl_->scan_function(stats, pfn, options);
+      impl_->scan_function(stats, pfn, options, &progress);
+    else
+    {
+      ++progress.functions_completed;
+      impl_->report_progress(&progress, stats, false, true);
+    }
   }
   if ( options.scan_unowned_executable_code )
-    impl_->scan_unowned_code(stats, options);
+    impl_->scan_unowned_code(stats, options, &progress);
+  progress.stage = NativeAnalysisProgressStage::COMPLETE;
+  impl_->report_progress(&progress, stats, true, true);
   return stats;
 }
 
@@ -1818,11 +1905,24 @@ NativeAnalysisStats NativeAnalysisProvider::analyze_function(
   if ( impl_->arch == NativeArchitecture::Unsupported
     || any_ea == kNativeBadAddress )
   {
+    if ( options.progress )
+    {
+      NativeAnalysisProgress progress;
+      progress.stage = NativeAnalysisProgressStage::COMPLETE;
+      progress.stage_boundary = true;
+      options.progress(progress);
+    }
     return stats;
   }
   func_t *pfn = get_func(ea_t(any_ea));
+  Impl::ProgressContext progress;
+  progress.options = &options;
+  progress.functions_total = pfn == nullptr ? 0 : 1;
+  impl_->report_progress(&progress, stats, true, true);
   if ( pfn != nullptr )
-    impl_->scan_function(stats, pfn, options);
+    impl_->scan_function(stats, pfn, options, &progress);
+  progress.stage = NativeAnalysisProgressStage::COMPLETE;
+  impl_->report_progress(&progress, stats, true, true);
   return stats;
 }
 

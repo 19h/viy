@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 : "${IDAT:?set IDAT to the IDA text-mode executable}"
 BUILD_DIR=${BUILD_DIR:-$ROOT/build-dev}
 WORK=${VIY_IDA_HEXRAYS_TEST_DIR:-/tmp/viy-hexrays-bridge}
+OBSERVABILITY_VERIFY=$ROOT/tests/verify_observability_log.py
 
 test -x "$IDAT"
 test -f "$BUILD_DIR/viy.dylib"
@@ -37,6 +38,7 @@ fi
 DB=$WORK/out/hexrays.i64
 LOG=$WORK/out/hexrays.log
 env IDAUSR="$WORK/user" \
+  VIY_LOG_LEVEL=2 VIY_PROGRESS_INTERVAL_MS=100 \
   VIY_HEXRAYS_BRIDGE=1 VIY_NATIVE=1 VIY_DEOBF=0 VIY_STATIC=0 \
   VIY_RAX_PATH="$WORK/out/does-not-exist.dylib" VIY_MAX_EPOCHS=1 \
   VIY_PERSIST_EVIDENCE=0 VIY_COMMENTS=0 VIY_WANT_CREFS=0 VIY_WANT_DREFS=0 \
@@ -55,5 +57,11 @@ if ! grep -Fq 'lifecycle=recent-cfunc' "$LOG"; then
   echo "error: Hex-Rays teardown lifecycle surface was not retained" >&2
   exit 1
 fi
+if ! grep -Fq '[viy] event=start ' "$LOG" \
+  || ! grep -Fq '[viy] event=complete ' "$LOG"; then
+  echo "error: real Hex-Rays run did not expose the viy lifecycle" >&2
+  exit 1
+fi
+python3 "$OBSERVABILITY_VERIFY" hexrays "$LOG"
 
 echo "VIY_HEXRAYS_BRIDGE passed; log: $LOG"

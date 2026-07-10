@@ -75,6 +75,7 @@ ida_add_plugin(viy
     src/viy.cpp
     src/rax_loader.cpp
     src/viy_config.cpp
+    src/diagnostics.cpp
     src/program_model.cpp
     src/program_model_core.cpp
     src/abi_policy.cpp
@@ -148,6 +149,14 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_compile_features(viy_config_tests PRIVATE cxx_std_17)
   viy_harden_test_target(viy_config_tests)
+
+  add_executable(viy_diagnostics_tests
+    tests/diagnostics_test.cpp
+    src/diagnostics.cpp)
+  target_include_directories(viy_diagnostics_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_features(viy_diagnostics_tests PRIVATE cxx_std_17)
+  viy_harden_test_target(viy_diagnostics_tests)
 
   add_executable(viy_emulation_worker_tests
     tests/emulation_workers_test.cpp
@@ -266,6 +275,10 @@ if(BUILD_TESTING)
       -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(viy_config_tests PRIVATE
       -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_compile_options(viy_diagnostics_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(viy_diagnostics_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_compile_options(viy_emulation_worker_tests PRIVATE
       -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(viy_emulation_worker_tests PRIVATE
@@ -307,6 +320,7 @@ if(BUILD_TESTING)
   add_test(NAME viy.evidence_lifecycle COMMAND viy_evidence_lifecycle_tests)
   add_test(NAME viy.evidence_apply_policy COMMAND viy_evidence_apply_policy_tests)
   add_test(NAME viy.config COMMAND viy_config_tests)
+  add_test(NAME viy.diagnostics COMMAND viy_diagnostics_tests)
   add_test(NAME viy.emulation_workers COMMAND viy_emulation_worker_tests)
   add_test(NAME viy.emu_evidence COMMAND viy_emu_evidence_tests)
   add_test(NAME viy.abi_policy COMMAND viy_abi_policy_tests)

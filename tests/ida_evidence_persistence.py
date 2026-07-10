@@ -84,7 +84,7 @@ def load_state():
 def run_mode():
     ida_auto.auto_wait()
     # A fully analyzed reopened IDB may not emit another auto_empty_finally
-    # notification after plugmod construction. Kick the hidden plugin through
+    # notification after plugmod construction. Kick the plugin through
     # its public run entry; the per-IDB `started` guard makes this idempotent.
     ida_loader.load_and_run_plugin("viy", 0)
     ida_auto.auto_wait()

@@ -721,9 +721,30 @@ void test_conflicts()
   add(dispatch_a);
   add(dispatch_b);
 
+  DispatchMapFact partial_a;
+  partial_a.site = 0x8300;
+  partial_a.cases = {{uint64_t{1}, 0x8310}};
+  DispatchMapFact partial_b = partial_a;
+  partial_b.cases[0].target = 0x8320;
+  add(partial_a);
+  add(partial_b);
+
+  DispatchMapFact complete_superset;
+  complete_superset.site = 0x8400;
+  complete_superset.cases = {{uint64_t{1}, 0x8410}, {uint64_t{2}, 0x8420}};
+  complete_superset.complete = true;
+  DispatchMapFact incomplete_subset;
+  incomplete_subset.site = 0x8400;
+  incomplete_subset.cases = {{uint64_t{1}, 0x8410}};
+  add(complete_superset);
+  add(incomplete_subset);
+
   add(CfgCandidateFact{0x9000, 0x9010, CfgEdgeKind::TrueBranch,
                        Reachability::Reached});
   add(CfgCandidateFact{0x9000, 0x9010, CfgEdgeKind::TrueBranch,
+                       Reachability::ProvenUnreachable});
+  add(BranchReachabilityFact{0x9100, 0x9110, Reachability::Reached});
+  add(CfgCandidateFact{0x9100, 0x9110, CfgEdgeKind::TrueBranch,
                        Reachability::ProvenUnreachable});
 
   add(RegisterValueFact{0xa000, RegisterStatePoint::BeforeInstruction,
@@ -811,6 +832,31 @@ void test_conflicts()
     });
   expect(!false_partial_call_conflict,
          "compatible partial call observations merge without a false conflict");
+  const bool false_complete_superset_conflict =
+    std::any_of(conflicts.begin(), conflicts.end(), [](const EvidenceConflict &conflict) {
+      return conflict.subject == 0x8400;
+    });
+  expect(!false_complete_superset_conflict,
+         "an incomplete subset does not contradict a compatible complete map");
+
+  std::set<FactDigest> exhaustive_contradicted;
+  for (const EvidenceConflict &conflict : conflicts)
+  {
+    if (conflict.severity == ConflictSeverity::Contradiction)
+    {
+      exhaustive_contradicted.insert(conflict.left);
+      exhaustive_contradicted.insert(conflict.right);
+    }
+  }
+  ContradictionScanStats contradiction_stats;
+  const std::set<FactDigest> fast_contradicted =
+    store.contradicted_payload_digests(&contradiction_stats);
+  expect(fast_contradicted == exhaustive_contradicted,
+         "fast contradiction scan is exactly equivalent to exhaustive conflicts");
+  expect(contradiction_stats.records_indexed == store.record_count(),
+         "fast contradiction scan accounts for every canonical record");
+  expect(contradiction_stats.payload_digests_computed == fast_contradicted.size(),
+         "fast contradiction scan hashes only participating payloads");
 }
 
 void test_persistence_adapter()

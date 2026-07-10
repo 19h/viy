@@ -63,6 +63,7 @@ struct EvidenceApplyPlan
   size_t contradiction_suppressed = 0;
   size_t below_trust_threshold = 0;
   size_t disabled_by_configuration = 0;
+  ContradictionScanStats contradiction_scan;
 };
 
 // Strong proof is sufficient by itself.  Otherwise, observations must clear
@@ -74,9 +75,10 @@ bool evidence_is_automatically_actionable(const EvidenceRecord &record);
 // to the same cross-run corroboration rule as other automatic actions.
 bool function_candidate_is_actionable(const EvidenceRecord &record);
 
-// Detect contradictions across the complete store and produce a deterministic
-// mutation plan.  Contradictions suppress every participating payload;
-// Variation and Ambiguity conflicts are retained and do not suppress actions.
+// Detect the exact contradiction-participant set across the complete store and
+// produce a deterministic mutation plan. Contradictions suppress every
+// participating payload; Variation and Ambiguity remain in the ledger but are
+// intentionally absent from the automatic-application scan.
 EvidenceApplyPlan plan_evidence_application(
   const EvidenceStore &store,
   const EvidenceApplyPolicy &policy = {});

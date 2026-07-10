@@ -169,6 +169,9 @@ public:
   bool usable() const;
   bool idle() const;
   EmulationWorkerStats stats() const;
+  // First bounded executor-initialization failure, empty when none has been
+  // observed. Returned by value under the same lock as stats().
+  std::string initialization_diagnostic() const;
 
 private:
   struct Impl;

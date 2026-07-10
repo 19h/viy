@@ -9,9 +9,9 @@
  *
  * A missing, unloadable, ABI-incompatible, or symbol-incomplete library yields a
  * clean "unavailable" result (rax_load() == nullptr) — never a hard link
- * dependency, never a crash, never an exception. This is what lets viy be
- * "transparent and invisible": IDA always loads the plugin; when librax is not
- * present the plugin simply does nothing.
+ * dependency, never a crash, never an exception. IDA can always load the
+ * plugin; when librax is absent, viy reports the capability loss and continues
+ * with independent providers.
  *
  */
 #pragma once
@@ -129,8 +129,7 @@ inline bool rax_can_analyze()
   return a != nullptr && a->analyze != nullptr;
 }
 
-// Precise reason emulation is unavailable (empty when available). For an
-// optional one-line diagnostic; viy stays silent by default.
+// Precise reason emulation is unavailable (empty when available).
 const char *rax_unavailable_reason();
 
 } // namespace viy

@@ -116,8 +116,17 @@ bool viy_detect_arch(ViyArch &arch_out, bool &big_endian_out)
   return arch_out != ViyArch::UNSUPPORTED;
 }
 
-void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
+ProgramSnapshotStats viy_snapshot(
+    ProgramImage &img, const ViyConfig &cfg,
+    const ProgramSnapshotProgressCallback &progress)
 {
+  ProgramSnapshotProgress snapshot_progress;
+  auto report = [&]
+  {
+    if ( progress )
+      progress(snapshot_progress);
+  };
+
   // Keep prior content generations so an incremental caller can distinguish an
   // unchanged function from one whose bytes or chunk topology changed.
   struct PriorIdentity { uint64_t hash = 0, generation = 0; };
@@ -139,12 +148,21 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
 
   // ---- segments -----------------------------------------------------------
   const int nsegs = get_segm_qty();
+  snapshot_progress.stage = ProgramSnapshotStage::SEGMENTS;
+  snapshot_progress.stats.segments_total =
+      nsegs <= 0 ? 0 : static_cast<size_t>(nsegs);
+  report();
   bool have_bounds = false;
   for ( int i = 0; i < nsegs; ++i )
   {
+    ++snapshot_progress.stats.segments_visited;
     segment_t *s = getnseg(i);
     if ( s == nullptr || s->end_ea <= s->start_ea )
+    {
+      ++snapshot_progress.stats.segments_invalid;
+      report();
       continue;
+    }
 
     SegImage si;
     si.start   = (uint64_t)s->start_ea;
@@ -161,7 +179,11 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
     ssize_t got = get_bytes(si.bytes.data(), (ssize_t)len, s->start_ea,
                             GMB_READALL, si.mask.data());
     if ( got < 0 )
+    {
+      ++snapshot_progress.stats.segments_read_failed;
+      report();
       continue;
+    }
 
     if ( !have_bounds )
     {
@@ -175,6 +197,8 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
       if ( si.end   > img.hi ) img.hi = si.end;
     }
     img.segs.push_back(std::move(si));
+    ++snapshot_progress.stats.segments_copied;
+    report();
   }
   std::sort(img.segs.begin(), img.segs.end(),
             [](const SegImage &a, const SegImage &b) { return a.start < b.start; });
@@ -182,19 +206,34 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
 
   // ---- function entries ---------------------------------------------------
   const size_t nfuncs = get_func_qty();
+  snapshot_progress.stage = ProgramSnapshotStage::FUNCTIONS;
+  snapshot_progress.stats.functions_total = nfuncs;
+  report();
   const size_t cap = cfg.max_funcs != 0 ? (size_t)cfg.max_funcs : nfuncs;
   img.entries.reserve(nfuncs < cap ? nfuncs : cap);
   for ( size_t i = 0; i < nfuncs; ++i )
   {
     if ( img.entries.size() >= cap )
+    {
+      snapshot_progress.stats.functions_excluded_by_limit = nfuncs - i;
       break;
+    }
+    ++snapshot_progress.stats.functions_visited;
     func_t *pfn = getn_func(i);
     if ( pfn == nullptr )
+    {
+      ++snapshot_progress.stats.functions_null;
+      report();
       continue;
+    }
     // Skip pure library/thunk stubs: their targets are already resolved and
     // emulating them adds noise, not missed refs.
     if ( (pfn->flags & (FUNC_LIB | FUNC_THUNK)) != 0 )
+    {
+      ++snapshot_progress.stats.functions_library_or_thunk;
+      report();
       continue;
+    }
     FuncRange func;
     func.start = (uint64_t)pfn->start_ea;
     func.end   = (uint64_t)pfn->end_ea; // compatibility: primary chunk end
@@ -210,6 +249,7 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
     // fallback so downstream complete-function membership never becomes empty.
     if ( func.chunks.empty() && func.end > func.start )
       func.chunks.push_back(FuncChunk{ func.start, func.end });
+    snapshot_progress.stats.chunks_included += func.chunks.size();
 
     func.byte_hash = viy_function_byte_hash(img, func);
     const auto old = prior.find(func.start);
@@ -223,9 +263,14 @@ void viy_snapshot(ProgramImage &img, const ViyConfig &cfg)
       func.generation = img.generation;
     }
     img.entries.push_back(std::move(func));
+    ++snapshot_progress.stats.functions_included;
+    report();
   }
   std::sort(img.entries.begin(), img.entries.end(),
             [](const FuncRange &a, const FuncRange &b) { return a.start < b.start; });
+  snapshot_progress.stage = ProgramSnapshotStage::COMPLETE;
+  report();
+  return snapshot_progress.stats;
 }
 
 } // namespace viy

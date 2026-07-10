@@ -2,8 +2,7 @@
  * viy_config.hpp — runtime caps for the emulation sweep.
  *
  * Configuration is intentionally minimal and dependency-light: sane defaults,
- * overridable via environment variables (so it stays invisible — no dialogs, no
- * required files). See viy.cfg for the documented knobs.
+ * overridable via environment variables with no dialogs or required files.
  */
 #pragma once
 
@@ -12,9 +11,19 @@
 
 namespace viy {
 
+enum class ViyLogLevel : uint8_t
+{
+  QUIET = 0,
+  SUMMARY = 1,
+  PROGRESS = 2,
+  TRACE = 3,
+};
+
 struct ViyConfig
 {
   bool     enabled       = true;    // master switch (VIY_ENABLED=0 disables)
+  ViyLogLevel log_level  = ViyLogLevel::PROGRESS; // visible bounded lifecycle/progress
+  uint64_t progress_interval_ms = 1000; // monotonic progress-log cadence
   uint64_t max_insns     = 200000;  // per-run instruction cap (bounds runaway/loops)
   uint64_t timeout_ms    = 1000;    // per-run wall-clock cap
   uint64_t max_funcs     = 0;       // 0 = every function; else stop after N entries

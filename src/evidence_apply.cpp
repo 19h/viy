@@ -40,9 +40,17 @@ bool append_comment(ea_t ea, const std::string &text)
 } // namespace
 
 EvidenceApplyStats viy_apply_evidence(const EvidenceStore &store,
-                                      const ViyConfig &cfg)
+                                      const ViyConfig &cfg,
+                                      const EvidenceApplyProgressCallback &progress)
 {
   EvidenceApplyStats stats;
+  if ( progress )
+  {
+    EvidenceApplyProgress event;
+    event.records_total = store.record_count();
+    event.stage_boundary = true;
+    progress(event);
+  }
   EvidenceApplyPolicy policy;
   policy.allow_function_recovery = cfg.want_function_recovery;
   policy.allow_unreachable_comments = cfg.want_comments;
@@ -50,7 +58,23 @@ EvidenceApplyStats viy_apply_evidence(const EvidenceStore &store,
   stats.records_considered = plan.decisions.size();
   stats.records_conflicted = plan.contradiction_suppressed;
   stats.records_below_policy = plan.below_trust_threshold;
+  stats.conflict_relations_examined =
+      plan.contradiction_scan.candidate_relations_examined;
+  stats.conflict_digests_computed =
+      plan.contradiction_scan.payload_digests_computed;
 
+  if ( progress )
+  {
+    EvidenceApplyProgress event;
+    event.stage = EvidenceApplyProgressStage::MUTATING;
+    event.records_total = plan.decisions.size();
+    event.records_conflicted = stats.records_conflicted;
+    event.records_below_policy = stats.records_below_policy;
+    event.stage_boundary = true;
+    progress(event);
+  }
+
+  size_t decision_index = 0;
   for ( const EvidenceApplyDecision &decision : plan.decisions )
   {
     switch ( decision.action )
@@ -99,6 +123,29 @@ EvidenceApplyStats viy_apply_evidence(const EvidenceStore &store,
         break;
       }
     }
+    ++decision_index;
+    if ( progress && (decision_index == plan.decisions.size()
+                   || decision_index % size_t(256) == 0) )
+    {
+      EvidenceApplyProgress event;
+      event.stage = EvidenceApplyProgressStage::MUTATING;
+      event.records_completed = decision_index;
+      event.records_total = plan.decisions.size();
+      event.records_conflicted = stats.records_conflicted;
+      event.records_below_policy = stats.records_below_policy;
+      progress(event);
+    }
+  }
+  if ( progress )
+  {
+    EvidenceApplyProgress event;
+    event.stage = EvidenceApplyProgressStage::COMPLETE;
+    event.records_completed = plan.decisions.size();
+    event.records_total = plan.decisions.size();
+    event.records_conflicted = stats.records_conflicted;
+    event.records_below_policy = stats.records_below_policy;
+    event.stage_boundary = true;
+    progress(event);
   }
   return stats;
 }

@@ -57,6 +57,14 @@ ViyConfig viy_load_config()
 {
   ViyConfig c;
   c.enabled     = env_bool("VIY_ENABLED", c.enabled);
+  int log_level = env_int("VIY_LOG_LEVEL", int(c.log_level));
+  if ( log_level < int(ViyLogLevel::QUIET) )
+    log_level = int(ViyLogLevel::QUIET);
+  if ( log_level > int(ViyLogLevel::TRACE) )
+    log_level = int(ViyLogLevel::TRACE);
+  c.log_level = ViyLogLevel(log_level);
+  c.progress_interval_ms = env_u64(
+      "VIY_PROGRESS_INTERVAL_MS", c.progress_interval_ms);
   c.max_insns   = env_u64("VIY_MAX_INSNS", c.max_insns);
   c.timeout_ms  = env_u64("VIY_TIMEOUT_MS", c.timeout_ms);
   c.max_funcs   = env_u64("VIY_MAX_FUNCS", c.max_funcs);
@@ -93,6 +101,12 @@ ViyConfig viy_load_config()
   c.want_opaque     = env_bool("VIY_OPAQUE", c.want_opaque);
   c.opaque_runs     = env_int("VIY_OPAQUE_RUNS", c.opaque_runs);
   c.want_hexrays_bridge = env_bool("VIY_HEXRAYS_BRIDGE", c.want_hexrays_bridge);
+  if ( c.progress_interval_ms == 0 )
+    c.progress_interval_ms = 1000;
+  if ( c.progress_interval_ms < 100 )
+    c.progress_interval_ms = 100;
+  if ( c.progress_interval_ms > 60000 )
+    c.progress_interval_ms = 60000;
   if ( c.opaque_runs < 2 )
     c.opaque_runs = 2;
   if ( c.opaque_runs > 16 )

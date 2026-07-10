@@ -137,7 +137,7 @@ bool IdaEvidenceAdapter::read_blob(std::vector<uint8_t> &out, std::string &error
         error = "validated evidence slot failed second decode: " + decode_error;
         return false;
       }
-      recovered.merge(other);
+      recovered.merge(other, false);
       if ( !recovered.serialize(out, &error) )
         return false;
       // Repair through the same stage-then-marker ordering used by writes.

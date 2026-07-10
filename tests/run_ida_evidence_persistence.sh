@@ -38,9 +38,11 @@ else
 fi
 
 SCRIPT=$ROOT/tests/ida_evidence_persistence.py
+OBSERVABILITY_SCRIPT=$ROOT/tests/ida_observability_smoke.py
+OBSERVABILITY_VERIFY=$ROOT/tests/verify_observability_log.py
 DB=$WORK/out/evidence.i64
 STATE=$WORK/out/state.json
-COMMON="IDAUSR=$WORK/user VIY_RAX_PATH=$RAX_LIB VIY_WORKERS=2 VIY_EXPLORE_RUNS=2 VIY_MAX_EPOCHS=1 VIY_HEXRAYS_BRIDGE=0"
+COMMON="IDAUSR=$WORK/user VIY_RAX_PATH=$RAX_LIB VIY_WORKERS=2 VIY_EXPLORE_RUNS=2 VIY_MAX_EPOCHS=1 VIY_HEXRAYS_BRIDGE=0 VIY_LOG_LEVEL=2 VIY_PROGRESS_INTERVAL_MS=100"
 
 run_ida() {
   mode=$1
@@ -87,6 +89,36 @@ if ! grep -Eq '[1-9][0-9]* dynamic cache hit\(s\)' "$CACHE_LOG"; then
   echo "error: real-IDAT run did not exercise the incremental dynamic cache" >&2
   exit 1
 fi
+if ! grep -Fq '[viy] event=start ' "$CACHE_LOG" \
+  || ! grep -Fq '[viy] event=complete ' "$CACHE_LOG"; then
+  echo "error: real-IDAT run did not expose the viy lifecycle" >&2
+  exit 1
+fi
+python3 "$OBSERVABILITY_VERIFY" cache "$CACHE_LOG"
+
+# Verify every logging level against a real plugin lifecycle. Summary must omit
+# progress/trace records, trace result taxonomy must equal terminal counters,
+# and quiet must suppress every viy line. The trace probe invokes the public
+# plug-in entry twice after completion and proves terminal elapsed time is frozen.
+SUMMARY_LOG=$WORK/out/summary.log
+env $COMMON VIY_LOG_LEVEL=1 VIY_MAX_EPOCHS=1 VIY_PERSIST_EVIDENCE=0 \
+  "$IDAT" -A -c -o"$WORK/out/summary.i64" -L"$SUMMARY_LOG" \
+  -S"$ROOT/tests/ida_worker_smoke.py" "$INPUT"
+python3 "$OBSERVABILITY_VERIFY" summary "$SUMMARY_LOG"
+
+TRACE_LOG=$WORK/out/trace.log
+env $COMMON VIY_LOG_LEVEL=3 VIY_MAX_EPOCHS=1 VIY_PERSIST_EVIDENCE=0 \
+  VIY_OBSERVABILITY_DELAY_MS=200 \
+  "$IDAT" -A -c -o"$WORK/out/trace.i64" -L"$TRACE_LOG" \
+  -S"$OBSERVABILITY_SCRIPT" "$INPUT"
+python3 "$OBSERVABILITY_VERIFY" trace "$TRACE_LOG"
+python3 "$OBSERVABILITY_VERIFY" manual "$TRACE_LOG"
+
+QUIET_LOG=$WORK/out/quiet.log
+env $COMMON VIY_LOG_LEVEL=0 VIY_MAX_EPOCHS=1 VIY_PERSIST_EVIDENCE=0 \
+  "$IDAT" -A -c -o"$WORK/out/quiet.i64" -L"$QUIET_LOG" \
+  -S"$ROOT/tests/ida_worker_smoke.py" "$INPUT"
+python3 "$OBSERVABILITY_VERIFY" quiet "$QUIET_LOG"
 
 # Memory hooks remain active for runtime strings/SMC, but VIY_WANT_DREFS=0 must
 # be an absolute gate on computed add_dref mutations.
@@ -119,6 +151,7 @@ for provider in native deobf; do
   fi
   env IDAUSR="$WORK/user" VIY_RAX_PATH="$WORK/out/does-not-exist.dylib" \
     VIY_STATIC=0 VIY_MAX_EPOCHS=1 VIY_PERSIST_EVIDENCE=1 \
+    VIY_LOG_LEVEL=2 VIY_PROGRESS_INTERVAL_MS=100 \
     VIY_COMMENTS=0 VIY_WANT_DREFS=0 VIY_EXPECT_PRODUCER="$PRODUCER" \
     $PROVIDER_ENV \
     "$IDAT" -A -c -o"$PROVIDER_DB" -L"$PROVIDER_LOG" \
@@ -127,6 +160,7 @@ for provider in native deobf; do
     echo "error: real-IDAT $provider-only provider smoke did not finish" >&2
     exit 1
   fi
+  python3 "$OBSERVABILITY_VERIFY" "$provider" "$PROVIDER_LOG"
 done
 mv "$DISABLED_COMPANION" "$COMPANION"
 trap - EXIT HUP INT TERM

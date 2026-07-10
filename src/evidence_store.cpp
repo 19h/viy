@@ -6,6 +6,7 @@
 #include <set>
 #include <sstream>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace viy {
@@ -191,7 +192,25 @@ void canonicalize_conflict_digests(EvidenceConflict &conflict)
     std::swap(conflict.left, conflict.right);
 }
 
-void add_conflict(std::vector<EvidenceConflict> &out,
+struct ConflictAccumulator
+{
+  std::vector<EvidenceConflict> conflicts;
+  std::unordered_map<const FactPayload *, FactDigest> digests;
+
+  const FactDigest &digest(const FactPayload &payload)
+  {
+    const auto found = digests.find(&payload);
+    if (found != digests.end())
+      return found->second;
+    FactDigest computed;
+    // This fallback is reachable only for a caller that did not pre-index a
+    // valid store payload. Keep it fail-closed and cache the result once.
+    stable_digest(payload, computed, nullptr);
+    return digests.emplace(&payload, computed).first->second;
+  }
+};
+
+void add_conflict(ConflictAccumulator &out,
                   ConflictType type,
                   ConflictSeverity severity,
                   const FactPayload &left_payload,
@@ -203,15 +222,13 @@ void add_conflict(std::vector<EvidenceConflict> &out,
   EvidenceConflict conflict;
   conflict.type = type;
   conflict.severity = severity;
-  // Store records are always valid, so digest failure cannot occur here.
-  std::string ignored;
-  stable_digest(left_payload, conflict.left, &ignored);
-  stable_digest(right_payload, conflict.right, &ignored);
+  conflict.left = out.digest(left_payload);
+  conflict.right = out.digest(right_payload);
   canonicalize_conflict_digests(conflict);
   conflict.subject = subject;
   conflict.secondary_subject = secondary;
   conflict.explanation = std::move(explanation);
-  out.push_back(std::move(conflict));
+  out.conflicts.push_back(std::move(conflict));
 }
 
 std::set<Address> dispatch_targets(const DispatchMapFact &fact)
@@ -222,6 +239,42 @@ std::set<Address> dispatch_targets(const DispatchMapFact &fact)
   if (fact.default_target.has_value())
     result.insert(*fact.default_target);
   return result;
+}
+
+bool dispatch_maps_contradict(const DispatchMapFact &left,
+                              const DispatchMapFact &right)
+{
+  if (left.site != right.site)
+    return false;
+
+  for (const DispatchCase &left_case : left.cases)
+  {
+    if (!left_case.selector.has_value())
+      continue;
+    for (const DispatchCase &right_case : right.cases)
+    {
+      if (right_case.selector != left_case.selector)
+        continue;
+      if (right_case.target != left_case.target && (left.complete || right.complete))
+        return true;
+      break;
+    }
+  }
+  if (left.default_target.has_value() && right.default_target.has_value() &&
+      left.default_target != right.default_target && (left.complete || right.complete))
+    return true;
+
+  const std::set<Address> left_targets = dispatch_targets(left);
+  const std::set<Address> right_targets = dispatch_targets(right);
+  if (left.complete)
+    for (Address target : right_targets)
+      if (left_targets.count(target) == 0)
+        return true;
+  if (right.complete)
+    for (Address target : left_targets)
+      if (right_targets.count(target) == 0)
+        return true;
+  return false;
 }
 
 const CallValue *find_call_value(const std::vector<CallValue> &values,
@@ -254,7 +307,7 @@ void compare_dispatch_maps(const FactPayload &left_payload,
                            const DispatchMapFact &left,
                            const FactPayload &right_payload,
                            const DispatchMapFact &right,
-                           std::vector<EvidenceConflict> &out)
+                           ConflictAccumulator &out)
 {
   if (left.site != right.site)
     return;
@@ -327,7 +380,7 @@ void compare_dispatch_maps(const FactPayload &left_payload,
 
 void compare_payloads(const FactPayload &left_payload,
                       const FactPayload &right_payload,
-                      std::vector<EvidenceConflict> &out)
+                      ConflictAccumulator &out)
 {
   if (const auto *left = std::get_if<CodeTargetFact>(&left_payload))
   {
@@ -723,7 +776,7 @@ AddResult EvidenceStore::add(AnalysisFact fact)
   return result;
 }
 
-MergeReport EvidenceStore::merge(const EvidenceStore &other)
+MergeReport EvidenceStore::merge(const EvidenceStore &other, bool count_conflicts)
 {
   MergeReport report;
   const std::vector<AnalysisFact> facts = other.flattened_facts();
@@ -749,7 +802,8 @@ MergeReport EvidenceStore::merge(const EvidenceStore &other)
   }
   report.records_after = record_count();
   report.observations_after = observation_count();
-  report.conflicts_after = detect_conflicts().size();
+  if (count_conflicts)
+    report.conflicts_after = detect_conflicts().size();
   return report;
 }
 
@@ -849,8 +903,15 @@ const EvidenceRecord *EvidenceStore::find(const FactPayload &payload) const
 
 std::vector<EvidenceConflict> EvidenceStore::detect_conflicts() const
 {
-  const std::vector<EvidenceRecord> ordered = records();
-  std::vector<EvidenceConflict> conflicts;
+  std::vector<const EvidenceRecord *> ordered;
+  ordered.reserve(records_.size());
+  ConflictAccumulator accumulator;
+  accumulator.digests.reserve(records_.size());
+  for (const auto &entry : records_)
+  {
+    ordered.push_back(&entry.second);
+    accumulator.digests.emplace(&entry.second.payload, sha256_bytes(entry.first));
+  }
 
   // Index by the smallest subject on which facts can conflict.  This avoids an
   // all-record O(n^2) scan while preserving exhaustive pairwise comparison
@@ -870,7 +931,7 @@ std::vector<EvidenceConflict> EvidenceStore::detect_conflicts() const
 
   for (size_t i = 0; i != ordered.size(); ++i)
   {
-    const FactPayload &payload = ordered[i].payload;
+    const FactPayload &payload = ordered[i]->payload;
     if (const auto *fact = std::get_if<CodeTargetFact>(&payload))
       code_targets[{fact->from, static_cast<uint8_t>(fact->kind)}].push_back(i);
     else if (const auto *fact = std::get_if<BranchReachabilityFact>(&payload))
@@ -902,8 +963,8 @@ std::vector<EvidenceConflict> EvidenceStore::detect_conflicts() const
   const auto compare_bucket = [&](const std::vector<size_t> &indices) {
     for (size_t i = 0; i < indices.size(); ++i)
       for (size_t j = i + 1; j < indices.size(); ++j)
-        compare_payloads(ordered[indices[i]].payload,
-                         ordered[indices[j]].payload, conflicts);
+        compare_payloads(ordered[indices[i]]->payload,
+                         ordered[indices[j]]->payload, accumulator);
   };
   const auto compare_buckets = [&](const auto &buckets) {
     for (const auto &entry : buckets)
@@ -920,27 +981,202 @@ std::vector<EvidenceConflict> EvidenceStore::detect_conflicts() const
   compare_buckets(calls);
 
   std::sort(regions.begin(), regions.end(), [&](size_t lhs, size_t rhs) {
-    const auto &left = std::get<CodeRegionFact>(ordered[lhs].payload);
-    const auto &right = std::get<CodeRegionFact>(ordered[rhs].payload);
+    const auto &left = std::get<CodeRegionFact>(ordered[lhs]->payload);
+    const auto &right = std::get<CodeRegionFact>(ordered[rhs]->payload);
     return std::tie(left.start, left.end, lhs) < std::tie(right.start, right.end, rhs);
   });
   for (size_t i = 0; i < regions.size(); ++i)
   {
-    const auto &left = std::get<CodeRegionFact>(ordered[regions[i]].payload);
+    const auto &left = std::get<CodeRegionFact>(ordered[regions[i]]->payload);
     for (size_t j = i + 1; j < regions.size(); ++j)
     {
-      const auto &right = std::get<CodeRegionFact>(ordered[regions[j]].payload);
+      const auto &right = std::get<CodeRegionFact>(ordered[regions[j]]->payload);
       if (right.start >= left.end)
         break;
-      compare_payloads(ordered[regions[i]].payload,
-                       ordered[regions[j]].payload, conflicts);
+      compare_payloads(ordered[regions[i]]->payload,
+                       ordered[regions[j]]->payload, accumulator);
     }
   }
 
+  std::vector<EvidenceConflict> &conflicts = accumulator.conflicts;
   std::sort(conflicts.begin(), conflicts.end(), conflict_less);
   conflicts.erase(std::unique(conflicts.begin(), conflicts.end(), conflicts_equal),
                   conflicts.end());
-  return conflicts;
+  return std::move(conflicts);
+}
+
+std::set<FactDigest> EvidenceStore::contradicted_payload_digests(
+    ContradictionScanStats *stats_out) const
+{
+  ContradictionScanStats local_stats;
+  ContradictionScanStats &stats = stats_out == nullptr ? local_stats : *stats_out;
+  stats = ContradictionScanStats{};
+  stats.records_indexed = records_.size();
+
+  struct IndexedPayload
+  {
+    const FactPayload *payload = nullptr;
+    const std::vector<uint8_t> *canonical_bytes = nullptr;
+    std::optional<FactDigest> digest;
+  };
+  std::vector<IndexedPayload> ordered;
+  ordered.reserve(records_.size());
+  for (const auto &entry : records_)
+    ordered.push_back(IndexedPayload{&entry.second.payload, &entry.first, std::nullopt});
+
+  std::set<FactDigest> contradicted;
+  auto mark = [&](size_t index)
+  {
+    IndexedPayload &entry = ordered[index];
+    if (!entry.digest.has_value())
+    {
+      entry.digest = sha256_bytes(*entry.canonical_bytes);
+      if (stats.payload_digests_computed != std::numeric_limits<size_t>::max())
+        ++stats.payload_digests_computed;
+    }
+    contradicted.insert(*entry.digest);
+  };
+  auto count_relation = [&]
+  {
+    if (stats.candidate_relations_examined != std::numeric_limits<size_t>::max())
+      ++stats.candidate_relations_examined;
+  };
+  auto mark_pair = [&](size_t left, size_t right)
+  {
+    mark(left);
+    mark(right);
+  };
+
+  std::map<std::pair<Address, uint8_t>, std::vector<size_t>> code_targets;
+  std::map<std::pair<Address, Address>, std::vector<size_t>> edges;
+  std::map<Address, std::vector<size_t>> function_evidence;
+  std::map<Address, std::vector<size_t>> dispatch_maps;
+  std::vector<size_t> regions;
+  for (size_t i = 0; i != ordered.size(); ++i)
+  {
+    const FactPayload &payload = *ordered[i].payload;
+    if (const auto *fact = std::get_if<CodeTargetFact>(&payload))
+      code_targets[{fact->from, static_cast<uint8_t>(fact->kind)}].push_back(i);
+    else if (const auto *fact = std::get_if<BranchReachabilityFact>(&payload))
+      edges[{fact->branch, fact->successor}].push_back(i);
+    else if (const auto *fact = std::get_if<CfgCandidateFact>(&payload))
+      edges[{fact->from, fact->to}].push_back(i);
+    else if (const auto *fact = std::get_if<FunctionTraitFact>(&payload))
+      function_evidence[fact->function].push_back(i);
+    else if (const auto *fact = std::get_if<FunctionOutcomeFact>(&payload))
+      function_evidence[fact->function].push_back(i);
+    else if (const auto *fact = std::get_if<DispatchMapFact>(&payload))
+      dispatch_maps[fact->site].push_back(i);
+    else if (std::holds_alternative<CodeRegionFact>(payload))
+      regions.push_back(i);
+  }
+
+  for (const auto &bucket : code_targets)
+  {
+    const std::vector<size_t> &indices = bucket.second;
+    for (size_t i = 0; i < indices.size(); ++i)
+    {
+      const auto &left = std::get<CodeTargetFact>(*ordered[indices[i]].payload);
+      for (size_t j = i + 1; j < indices.size(); ++j)
+      {
+        count_relation();
+        const auto &right = std::get<CodeTargetFact>(*ordered[indices[j]].payload);
+        if (left.target != right.target && (left.unique || right.unique))
+          mark_pair(indices[i], indices[j]);
+      }
+    }
+  }
+
+  const auto edge_state = [&](size_t index)
+  {
+    const FactPayload &payload = *ordered[index].payload;
+    if (const auto *branch = std::get_if<BranchReachabilityFact>(&payload))
+      return branch->state;
+    return std::get<CfgCandidateFact>(payload).state;
+  };
+  for (const auto &bucket : edges)
+  {
+    const std::vector<size_t> &indices = bucket.second;
+    for (size_t i = 0; i < indices.size(); ++i)
+      for (size_t j = i + 1; j < indices.size(); ++j)
+      {
+        count_relation();
+        if (opposite_reachability(edge_state(indices[i]), edge_state(indices[j])))
+          mark_pair(indices[i], indices[j]);
+      }
+  }
+
+  for (const auto &bucket : function_evidence)
+  {
+    std::vector<size_t> returns;
+    std::vector<size_t> no_returns;
+    std::vector<size_t> returned_outcomes;
+    for (size_t index : bucket.second)
+    {
+      const FactPayload &payload = *ordered[index].payload;
+      if (const auto *trait = std::get_if<FunctionTraitFact>(&payload))
+      {
+        if (trait->trait == FunctionTraitKind::Returns)
+          returns.push_back(index);
+        else if (trait->trait == FunctionTraitKind::NoReturn)
+          no_returns.push_back(index);
+      }
+      else if (const auto *outcome = std::get_if<FunctionOutcomeFact>(&payload))
+      {
+        if (outcome->stop == FunctionStopKind::Returned)
+          returned_outcomes.push_back(index);
+      }
+    }
+    if (!returns.empty() && !no_returns.empty())
+    {
+      count_relation();
+      for (size_t index : returns) mark(index);
+      for (size_t index : no_returns) mark(index);
+    }
+    if (!no_returns.empty() && !returned_outcomes.empty())
+    {
+      count_relation();
+      for (size_t index : no_returns) mark(index);
+      for (size_t index : returned_outcomes) mark(index);
+    }
+  }
+
+  for (const auto &bucket : dispatch_maps)
+  {
+    const std::vector<size_t> &indices = bucket.second;
+    for (size_t i = 0; i < indices.size(); ++i)
+    {
+      const auto &left = std::get<DispatchMapFact>(*ordered[indices[i]].payload);
+      for (size_t j = i + 1; j < indices.size(); ++j)
+      {
+        count_relation();
+        const auto &right = std::get<DispatchMapFact>(*ordered[indices[j]].payload);
+        if (dispatch_maps_contradict(left, right))
+          mark_pair(indices[i], indices[j]);
+      }
+    }
+  }
+
+  std::sort(regions.begin(), regions.end(), [&](size_t lhs, size_t rhs)
+  {
+    const auto &left = std::get<CodeRegionFact>(*ordered[lhs].payload);
+    const auto &right = std::get<CodeRegionFact>(*ordered[rhs].payload);
+    return std::tie(left.start, left.end, lhs) < std::tie(right.start, right.end, rhs);
+  });
+  for (size_t i = 0; i < regions.size(); ++i)
+  {
+    const auto &left = std::get<CodeRegionFact>(*ordered[regions[i]].payload);
+    for (size_t j = i + 1; j < regions.size(); ++j)
+    {
+      const auto &right = std::get<CodeRegionFact>(*ordered[regions[j]].payload);
+      if (right.start >= left.end)
+        break;
+      count_relation();
+      if (region_kinds_incompatible(left.kind, right.kind))
+        mark_pair(regions[i], regions[j]);
+    }
+  }
+  return contradicted;
 }
 
 bool EvidenceStore::serialize(std::vector<uint8_t> &out, std::string *error) const
@@ -1083,14 +1319,15 @@ bool EvidenceStore::restore(const EvidencePersistenceAdapter &adapter,
                                      decoded.record_count();
     replacement.records_after = decoded.record_count();
     replacement.observations_after = decoded.observation_count();
-    replacement.conflicts_after = decoded.detect_conflicts().size();
+    if (report != nullptr)
+      replacement.conflicts_after = decoded.detect_conflicts().size();
     *this = std::move(decoded);
     if (report != nullptr)
       *report = std::move(replacement);
     return true;
   }
 
-  MergeReport merged = merge(decoded);
+  MergeReport merged = merge(decoded, report != nullptr);
   if (report != nullptr)
     *report = std::move(merged);
   return true;

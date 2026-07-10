@@ -152,18 +152,11 @@ bool function_candidate_is_actionable(const EvidenceRecord &record)
 EvidenceApplyPlan plan_evidence_application(const EvidenceStore &store,
                                             const EvidenceApplyPolicy &policy)
 {
-  std::set<FactDigest> contradicted;
-  for (const EvidenceConflict &conflict : store.detect_conflicts())
-  {
-    if (conflict.severity == ConflictSeverity::Contradiction)
-    {
-      contradicted.insert(conflict.left);
-      contradicted.insert(conflict.right);
-    }
-  }
+  EvidenceApplyPlan plan;
+  const std::set<FactDigest> contradicted =
+    store.contradicted_payload_digests(&plan.contradiction_scan);
 
   const std::vector<EvidenceRecord> records = store.records();
-  EvidenceApplyPlan plan;
   plan.decisions.reserve(records.size());
   for (const EvidenceRecord &record : records)
   {

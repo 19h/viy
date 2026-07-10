@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -115,6 +116,13 @@ struct EvidenceConflict
 
 bool conflict_less(const EvidenceConflict &lhs, const EvidenceConflict &rhs);
 
+struct ContradictionScanStats
+{
+  size_t records_indexed = 0;
+  size_t candidate_relations_examined = 0;
+  size_t payload_digests_computed = 0;
+};
+
 struct StoreCodecLimits
 {
   size_t max_blob_bytes = 64u * 1024u * 1024u;
@@ -155,7 +163,9 @@ public:
   EvidenceStore &operator=(EvidenceStore &&other) noexcept;
 
   AddResult add(AnalysisFact fact);
-  MergeReport merge(const EvidenceStore &other);
+  // conflict count materialization can be disabled when the caller discards
+  // the report; all record/observation merge semantics remain identical.
+  MergeReport merge(const EvidenceStore &other, bool count_conflicts = true);
 
   void clear();
   bool empty() const { return records_.empty(); }
@@ -188,6 +198,14 @@ public:
   const EvidenceRecord *find(const FactPayload &payload) const;
 
   std::vector<EvidenceConflict> detect_conflicts() const;
+
+  // Fast path used by automatic application. It returns exactly the payload
+  // identities participating in Contradiction-severity conflicts without
+  // materializing Variation/Ambiguity pairs. Complexity is O(n log n + p),
+  // where p contains only contradiction-capable subject relations and
+  // overlapping code-region pairs—not high-cardinality value variations.
+  std::set<FactDigest> contradicted_payload_digests(
+      ContradictionScanStats *stats = nullptr) const;
 
   // The store envelope has magic, schema version, observation count and a
   // SHA-256 trailer.  deserialize is transactional: `out` is unchanged unless

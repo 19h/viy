@@ -1,15 +1,15 @@
 /*
- * viy.cpp — plugin lifecycle & the transparent, chunked sweep.
+ * viy.cpp — plugin lifecycle, observability, and the chunked sweep.
  *
- * viy is a hidden, multi-IDB, database-modifying plugin. IDA instantiates one
+ * viy is a multi-IDB, database-modifying plugin. IDA instantiates one
  * plugmod per open database; in its constructor viy hooks HT_IDB and waits for
  * the first auto-analysis pass to finish (idb_event::auto_empty_finally). It
  * then snapshots the program and submits immutable function jobs to independent
  * off-thread rax engines. The UI timer drains results in deterministic function
  * order; every IDA query and database mutation remains on the main thread. If
  * librax is absent or a backend cannot be driven, native/static providers still
- * run. There are no dialogs or errors, and at most one summary line when viy
- * actually finds something.
+ * run. Bounded, non-modal lifecycle/progress diagnostics are emitted from the
+ * main thread to IDA's Output window and headless log.
  */
 #include <algorithm>
 #include <chrono>
@@ -29,6 +29,7 @@
 
 #include "rax_loader.hpp"
 #include "viy_config.hpp"
+#include "diagnostics.hpp"
 #include "program_model.hpp"
 #include "emu_driver.hpp"
 #include "emulation_workers.hpp"
@@ -69,6 +70,7 @@ struct viy_t : public plugmod_t
   {
     size_t index = 0;
     uint64_t fingerprint = 0;
+    size_t requested_runs = 0;
   };
   struct FunctionEvidenceIdentity
   {
@@ -89,6 +91,7 @@ struct viy_t : public plugmod_t
 
   size_t next = 0;         // next function-entry index to submit/process
   size_t funcs_done = 0;
+  size_t epoch_funcs_done = 0;
   int epoch = 0;
   bool waiting_for_auto = false;
   bool inline_mode = false;
@@ -122,6 +125,27 @@ struct viy_t : public plugmod_t
   EnrichStats estats;      // from the value-derived enrichment pass
   AdvStats astats;         // from the function-level advanced analyses
   bool started = false;
+  bool finished = false;
+
+  ViyDiagnosticPhase diagnostic_phase =
+      ViyDiagnosticPhase::WAITING_FOR_AUTOANALYSIS;
+  std::chrono::steady_clock::time_point diagnostic_start =
+      std::chrono::steady_clock::now();
+  uint64_t terminal_elapsed_ms = 0;
+  bool terminal_elapsed_valid = false;
+  uint64_t last_progress_ms = 0;
+  EmulationWorkerStats last_worker_stats;
+  bool worker_initialization_reported = false;
+  ProgramSnapshotStats snapshot_stats;
+  uint64_t jobs_completed = 0;
+  uint64_t jobs_cancelled = 0;
+  uint64_t jobs_unavailable = 0;
+  uint64_t jobs_failed = 0;
+  uint64_t runs_requested = 0;
+  uint64_t runs_started = 0;
+  std::map<std::string, size_t> worker_diagnostics;
+  std::string completion_reason = "stable";
+  std::string last_skip_reason;
 
   viy_t();
   virtual ~viy_t();
@@ -138,11 +162,145 @@ struct viy_t : public plugmod_t
   uint64_t change_count() const;
   EmulationJob build_emulation_job(const FuncRange &func) const;
   void process_function(size_t index, EmulationJobResult result);
+  bool log_at_least(ViyLogLevel minimum) const;
+  uint64_t current_diagnostic_elapsed_ms() const;
+  uint64_t diagnostic_elapsed_ms() const;
+  void log_event(ViyLogLevel minimum, const std::string &event) const;
+  void log_progress_event(const std::string &event, bool force = false);
+  void log_snapshot_progress(const ProgramSnapshotProgress &progress);
+  void log_native_progress(const NativeAnalysisProgress &progress);
+  void log_deobf_progress(const DeobfAnalysisProgress &progress);
+  void log_evidence_progress(const EvidenceApplyProgress &progress);
+  void report_worker_initialization();
+  ViyRuntimeStatus runtime_status() const;
+  void emit_status(bool force = false,
+                   ViyLogLevel minimum = ViyLogLevel::PROGRESS);
+  void set_diagnostic_phase(ViyDiagnosticPhase phase,
+                            const char *detail = nullptr);
+  void record_worker_result(const EmulationJobResult &result,
+                            size_t requested_run_count);
+  void log_skip(const char *reason);
   void stop_workers();
   void start_sweep();
   bool process_batch(int count); // true => more entries remain
   void finish();
 };
+
+namespace {
+
+const char *enabled_word(bool enabled)
+{
+  return enabled ? "on" : "off";
+}
+
+const char *arch_name(ViyArch arch)
+{
+  switch ( arch )
+  {
+    case ViyArch::X86_16:  return "x86-16";
+    case ViyArch::X86_32:  return "x86-32";
+    case ViyArch::X86_64:  return "x86-64";
+    case ViyArch::ARM64:   return "aarch64";
+    case ViyArch::ARM32:   return "aarch32";
+    case ViyArch::RISCV64: return "riscv64";
+    case ViyArch::CORTEX_M: return "cortex-m";
+    case ViyArch::HEXAGON: return "hexagon";
+    case ViyArch::UNSUPPORTED: break;
+  }
+  return "unsupported";
+}
+
+const char *worker_status_name(EmulationJobStatus status)
+{
+  switch ( status )
+  {
+    case EmulationJobStatus::COMPLETED:   return "completed";
+    case EmulationJobStatus::CANCELLED:   return "cancelled";
+    case EmulationJobStatus::UNAVAILABLE: return "unavailable";
+    case EmulationJobStatus::FAILED:      return "failed";
+  }
+  return "unknown";
+}
+
+const char *native_capability_name(NativeCapabilityState state)
+{
+  switch ( state )
+  {
+    case NativeCapabilityState::Unknown:     return "unknown";
+    case NativeCapabilityState::Available:   return "available";
+    case NativeCapabilityState::Unavailable: return "unavailable";
+  }
+  return "unknown";
+}
+
+NativeCapabilityState merge_native_capability(
+    NativeCapabilityState left, NativeCapabilityState right)
+{
+  if ( left == NativeCapabilityState::Unavailable
+    || right == NativeCapabilityState::Unavailable )
+  {
+    return NativeCapabilityState::Unavailable;
+  }
+  if ( left == NativeCapabilityState::Available
+    || right == NativeCapabilityState::Available )
+  {
+    return NativeCapabilityState::Available;
+  }
+  return NativeCapabilityState::Unknown;
+}
+
+const char *snapshot_stage_name(ProgramSnapshotStage stage)
+{
+  switch ( stage )
+  {
+    case ProgramSnapshotStage::SEGMENTS:  return "segments";
+    case ProgramSnapshotStage::FUNCTIONS: return "functions";
+    case ProgramSnapshotStage::COMPLETE:  return "complete";
+  }
+  return "unknown";
+}
+
+const char *native_progress_stage_name(NativeAnalysisProgressStage stage)
+{
+  switch ( stage )
+  {
+    case NativeAnalysisProgressStage::FUNCTIONS:    return "functions";
+    case NativeAnalysisProgressStage::UNOWNED_CODE: return "unowned-code";
+    case NativeAnalysisProgressStage::COMPLETE:     return "complete";
+  }
+  return "unknown";
+}
+
+const char *deobf_progress_stage_name(DeobfAnalysisProgressStage stage)
+{
+  switch ( stage )
+  {
+    case DeobfAnalysisProgressStage::FUNCTIONS: return "functions";
+    case DeobfAnalysisProgressStage::COMPLETE:  return "complete";
+  }
+  return "unknown";
+}
+
+const char *evidence_progress_stage_name(EvidenceApplyProgressStage stage)
+{
+  switch ( stage )
+  {
+    case EvidenceApplyProgressStage::PLANNING: return "planning";
+    case EvidenceApplyProgressStage::MUTATING: return "mutating";
+    case EvidenceApplyProgressStage::COMPLETE: return "complete";
+  }
+  return "unknown";
+}
+
+std::string hex_address(uint64_t address)
+{
+  char buffer[24];
+  qsnprintf(buffer, sizeof(buffer), "0x%llX",
+            static_cast<unsigned long long>(address));
+  return buffer;
+}
+
+} // namespace
 
 //-----------------------------------------------------------------------------
 ssize_t idaapi viy_idb_listener_t::on_event(ssize_t code, va_list)
@@ -230,14 +388,285 @@ static void merge_deobf_stats(DeobfAnalysisStats &dst,
 }
 
 //-----------------------------------------------------------------------------
+bool viy_t::log_at_least(ViyLogLevel minimum) const
+{
+  return static_cast<unsigned>(cfg.log_level)
+      >= static_cast<unsigned>(minimum);
+}
+
+//-----------------------------------------------------------------------------
+uint64_t viy_t::current_diagnostic_elapsed_ms() const
+{
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - diagnostic_start).count();
+  return elapsed <= 0 ? 0 : static_cast<uint64_t>(elapsed);
+}
+
+//-----------------------------------------------------------------------------
+uint64_t viy_t::diagnostic_elapsed_ms() const
+{
+  return terminal_elapsed_valid ? terminal_elapsed_ms
+                                : current_diagnostic_elapsed_ms();
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::log_event(ViyLogLevel minimum, const std::string &event) const
+{
+  if ( log_at_least(minimum) )
+    msg("[viy] %s\n", event.c_str());
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::log_progress_event(const std::string &event, bool force)
+{
+  if ( !log_at_least(ViyLogLevel::PROGRESS) )
+    return;
+  const uint64_t now = diagnostic_elapsed_ms();
+  if ( !viy_diagnostic_due(now, last_progress_ms,
+                           cfg.progress_interval_ms, force) )
+  {
+    return;
+  }
+  log_event(ViyLogLevel::PROGRESS, event);
+  last_progress_ms = now;
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::log_snapshot_progress(const ProgramSnapshotProgress &progress)
+{
+  const ProgramSnapshotStats &s = progress.stats;
+  std::string line = "event=progress phase=snapshotting stage=";
+  line += snapshot_stage_name(progress.stage);
+  line += " segments=" + std::to_string(s.segments_visited) + "/"
+       + std::to_string(s.segments_total);
+  line += " segments_copied=" + std::to_string(s.segments_copied);
+  line += " segment_read_failures=" + std::to_string(s.segments_read_failed);
+  line += " functions=" + std::to_string(s.functions_visited) + "/"
+       + std::to_string(s.functions_total);
+  line += " functions_included=" + std::to_string(s.functions_included);
+  line += " functions_excluded=" + std::to_string(
+      s.functions_library_or_thunk + s.functions_excluded_by_limit
+    + s.functions_null);
+  line += " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms());
+  const bool boundary = progress.stage == ProgramSnapshotStage::COMPLETE
+                     || (progress.stage == ProgramSnapshotStage::SEGMENTS
+                         && s.segments_visited == 0)
+                     || (progress.stage == ProgramSnapshotStage::FUNCTIONS
+                         && s.functions_visited == 0);
+  log_progress_event(line, boundary);
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::log_native_progress(const NativeAnalysisProgress &progress)
+{
+  std::string line = "event=progress phase=native-analysis stage=";
+  line += native_progress_stage_name(progress.stage);
+  line += " functions=" + std::to_string(progress.functions_completed) + "/"
+       + std::to_string(progress.functions_total);
+  line += " instructions=" + std::to_string(progress.instructions_scanned);
+  line += " facts_emitted=" + std::to_string(progress.facts_emitted);
+  line += " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms());
+  log_progress_event(line, progress.stage_boundary);
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::log_deobf_progress(const DeobfAnalysisProgress &progress)
+{
+  std::string line = "event=progress phase=deobfuscation-analysis stage=";
+  line += deobf_progress_stage_name(progress.stage);
+  line += " functions=" + std::to_string(progress.functions_completed) + "/"
+       + std::to_string(progress.functions_total);
+  line += " blocks=" + std::to_string(progress.blocks_scanned);
+  line += " instructions=" + std::to_string(progress.instructions_scanned);
+  line += " facts_emitted=" + std::to_string(progress.facts_emitted);
+  line += " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms());
+  log_progress_event(line, progress.stage_boundary);
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::log_evidence_progress(const EvidenceApplyProgress &progress)
+{
+  std::string line = "event=progress phase=applying-evidence stage=";
+  line += evidence_progress_stage_name(progress.stage);
+  line += " records=" + std::to_string(progress.records_completed) + "/"
+       + std::to_string(progress.records_total);
+  line += " conflicted=" + std::to_string(progress.records_conflicted);
+  line += " below_policy=" + std::to_string(progress.records_below_policy);
+  line += " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms());
+  log_progress_event(line, progress.stage_boundary);
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::report_worker_initialization()
+{
+  if ( worker_pool == nullptr || worker_initialization_reported )
+    return;
+  const EmulationWorkerStats workers = worker_pool->stats();
+  if ( workers.initialized_workers < workers.requested_workers )
+    return;
+
+  const ViyDynamicCapability state = viy_dynamic_capability(
+      static_cast<uint64_t>(workers.requested_workers),
+      static_cast<uint64_t>(workers.initialized_workers),
+      static_cast<uint64_t>(workers.available_workers),
+      static_cast<uint64_t>(workers.unavailable_workers));
+  std::string line = "event=workers state=";
+  line += viy_dynamic_capability_name(state);
+  line += " requested=" + std::to_string(workers.requested_workers);
+  line += " initialized=" + std::to_string(workers.initialized_workers);
+  line += " available=" + std::to_string(workers.available_workers);
+  line += " unavailable=" + std::to_string(workers.unavailable_workers);
+  const std::string diagnostic = viy_sanitize_diagnostic(
+      worker_pool->initialization_diagnostic());
+  if ( !diagnostic.empty() )
+    line += " message=\"" + diagnostic + "\"";
+  line += " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms());
+  log_event(ViyLogLevel::SUMMARY, line);
+  worker_initialization_reported = true;
+}
+
+//-----------------------------------------------------------------------------
+ViyRuntimeStatus viy_t::runtime_status() const
+{
+  ViyRuntimeStatus status;
+  status.phase = diagnostic_phase;
+  status.epoch = started ? static_cast<uint64_t>(epoch + 1) : 0;
+  status.epoch_limit = static_cast<uint64_t>(cfg.max_epochs);
+  status.functions_done = static_cast<uint64_t>(epoch_funcs_done);
+  status.functions_total = static_cast<uint64_t>(img.entries.size());
+  status.functions_submitted = static_cast<uint64_t>(next);
+  status.cache_hits = static_cast<uint64_t>(dynamic_cache_hits);
+
+  EmulationWorkerStats workers = last_worker_stats;
+  if ( worker_pool != nullptr )
+    workers = worker_pool->stats();
+  status.workers_initialized = static_cast<uint64_t>(workers.initialized_workers);
+  status.workers_available = static_cast<uint64_t>(workers.available_workers);
+  status.workers_unavailable = static_cast<uint64_t>(workers.unavailable_workers);
+  status.workers_requested = static_cast<uint64_t>(workers.requested_workers);
+  status.jobs_queued = static_cast<uint64_t>(workers.queued);
+  status.jobs_running = static_cast<uint64_t>(workers.running);
+  status.jobs_ready = static_cast<uint64_t>(workers.ready_in_order_or_later);
+  status.jobs_completed = jobs_completed;
+  status.jobs_cancelled = jobs_cancelled;
+  status.jobs_unavailable = jobs_unavailable;
+  status.jobs_failed = jobs_failed;
+  status.runs_requested = runs_requested;
+  status.runs_started = runs_started;
+  status.evidence_records = static_cast<uint64_t>(evidence.record_count());
+  status.changes = change_count();
+  status.elapsed_ms = diagnostic_elapsed_ms();
+  return status;
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::emit_status(bool force, ViyLogLevel minimum)
+{
+  if ( !log_at_least(minimum) )
+    return;
+  const uint64_t now = diagnostic_elapsed_ms();
+  if ( !viy_diagnostic_due(now, last_progress_ms,
+                           cfg.progress_interval_ms, force) )
+  {
+    return;
+  }
+  log_event(minimum, viy_format_runtime_status(runtime_status()));
+  last_progress_ms = now;
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::set_diagnostic_phase(ViyDiagnosticPhase phase, const char *detail)
+{
+  diagnostic_phase = phase;
+  const uint64_t now = diagnostic_elapsed_ms();
+  std::string line = "event=phase phase=";
+  line += viy_diagnostic_phase_name(phase);
+  line += " epoch=" + std::to_string(started ? epoch + 1 : 0)
+       + "/" + std::to_string(cfg.max_epochs);
+  line += " elapsed_ms=" + std::to_string(now);
+  if ( detail != nullptr && detail[0] != '\0' )
+    line += " detail=\"" + viy_sanitize_diagnostic(detail) + "\"";
+  log_event(ViyLogLevel::SUMMARY, line);
+  last_progress_ms = now;
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::record_worker_result(const EmulationJobResult &result,
+                                 size_t requested_run_count)
+{
+  runs_requested += static_cast<uint64_t>(requested_run_count);
+  for ( const EmulationRunResult &run : result.runs )
+    if ( run.ran )
+      ++runs_started;
+
+  switch ( result.status )
+  {
+    case EmulationJobStatus::COMPLETED:   ++jobs_completed; break;
+    case EmulationJobStatus::CANCELLED:   ++jobs_cancelled; break;
+    case EmulationJobStatus::UNAVAILABLE: ++jobs_unavailable; break;
+    case EmulationJobStatus::FAILED:      ++jobs_failed; break;
+  }
+
+  const std::string diagnostic = viy_sanitize_diagnostic(result.diagnostic);
+  if ( !diagnostic.empty() )
+  {
+    auto existing = worker_diagnostics.find(diagnostic);
+    if ( existing != worker_diagnostics.end() )
+      ++existing->second;
+    else if ( worker_diagnostics.size() < 8 )
+      worker_diagnostics.emplace(diagnostic, 1);
+  }
+
+  if ( log_at_least(ViyLogLevel::TRACE) )
+  {
+    std::string line = "event=worker-result function=";
+    line += hex_address(result.function_start);
+    line += " status=";
+    line += worker_status_name(result.status);
+    line += " runs_started=" + std::to_string(
+        static_cast<size_t>(std::count_if(
+            result.runs.begin(), result.runs.end(),
+            [](const EmulationRunResult &run) { return run.ran; })));
+    line += "/" + std::to_string(requested_run_count);
+    line += " edges=" + std::to_string(result.merged.edges.size());
+    line += " data_accesses=" + std::to_string(result.merged.data.size());
+    if ( !diagnostic.empty() )
+      line += " message=\"" + diagnostic + "\"";
+    log_event(ViyLogLevel::TRACE, line);
+  }
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::log_skip(const char *reason)
+{
+  const std::string next_reason = reason == nullptr ? "unknown" : reason;
+  const bool changed = diagnostic_phase != ViyDiagnosticPhase::SKIPPED
+                    || last_skip_reason != next_reason;
+  last_skip_reason = next_reason;
+  if ( !changed )
+    return;
+  if ( !terminal_elapsed_valid )
+  {
+    terminal_elapsed_ms = current_diagnostic_elapsed_ms();
+    terminal_elapsed_valid = true;
+  }
+  diagnostic_phase = ViyDiagnosticPhase::SKIPPED;
+  log_event(ViyLogLevel::SUMMARY,
+            "event=skip reason=" + last_skip_reason
+          + " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms()));
+  emit_status(true, ViyLogLevel::SUMMARY);
+}
+
+//-----------------------------------------------------------------------------
 viy_t::viy_t()
 {
   cfg = viy_load_config();
+  bool restored = false;
+  std::string restore_error;
   if ( cfg.persist_evidence )
   {
-    std::string ignored;
-    evidence.restore(evidence_adapter, analysis::RestoreMode::Replace,
-                     nullptr, &ignored);
+    restored = evidence.restore(evidence_adapter, analysis::RestoreMode::Replace,
+                                nullptr, &restore_error);
   }
   initialize_generation_allocator();
   if ( cfg.want_native )
@@ -253,9 +682,43 @@ viy_t::viy_t()
   }
   if ( cfg.want_hexrays_bridge )
   {
-    std::string ignored;
-    hexrays.start({}, &ignored);
+    std::string reason;
+    const bool installed = hexrays.start({}, &reason);
+    std::string line = "event=hexrays requested=on installed=";
+    line += enabled_word(installed);
+    line += " compiled=";
+    line += enabled_word(HexRaysEvidenceBridge::compiled_with_hexrays_sdk());
+    if ( !reason.empty() )
+      line += " message=\"" + viy_sanitize_diagnostic(reason) + "\"";
+    log_event(ViyLogLevel::SUMMARY, line);
   }
+
+  std::string loaded = "event=loaded enabled=";
+  loaded += enabled_word(cfg.enabled);
+  loaded += " log_level=" + std::to_string(static_cast<unsigned>(cfg.log_level));
+  loaded += " progress_interval_ms=" + std::to_string(cfg.progress_interval_ms);
+  loaded += " persistence=";
+  loaded += enabled_word(cfg.persist_evidence);
+  loaded += " restore=";
+  if ( restored )
+    loaded += "ok";
+  else if ( !cfg.persist_evidence )
+    loaded += "disabled";
+  else if ( restore_error.find("not found") != std::string::npos )
+    loaded += "none";
+  else
+    loaded += "error";
+  loaded += " evidence_records=" + std::to_string(evidence.record_count());
+  loaded += " evidence_observations=" + std::to_string(evidence.observation_count());
+  log_event(ViyLogLevel::SUMMARY, loaded);
+  if ( !restored && cfg.persist_evidence && !restore_error.empty()
+    && restore_error.find("not found") == std::string::npos )
+  {
+    log_event(ViyLogLevel::SUMMARY,
+              "event=diagnostic scope=persistence operation=restore message=\""
+            + viy_sanitize_diagnostic(restore_error) + "\"");
+  }
+  set_diagnostic_phase(ViyDiagnosticPhase::WAITING_FOR_AUTOANALYSIS);
   idb.owner = this;
   hook_event_listener(HT_IDB, &idb);
   // If the database is already fully analyzed when we load, run right away.
@@ -358,6 +821,11 @@ analysis::EvidenceStore viy_t::active_evidence_view() const
 //-----------------------------------------------------------------------------
 viy_t::~viy_t()
 {
+  if ( started && !finished )
+    log_event(ViyLogLevel::SUMMARY,
+              "event=stop reason=plugin-unload phase="
+            + std::string(viy_diagnostic_phase_name(diagnostic_phase))
+            + " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms()));
   if ( timer != nullptr )
   {
     unregister_timer(timer);
@@ -382,20 +850,34 @@ void viy_t::on_analysis_done()
     return;
 
   if ( !cfg.enabled )
+  {
+    log_skip("disabled");
     return;
+  }
 
   ViyArch arch;
   bool be;
   if ( !viy_detect_arch(arch, be) )
+  {
+    log_skip("unsupported-architecture");
     return;
+  }
 
   // Native providers remain useful without librax. Each rax-backed provider is
   // capability-gated independently in begin_epoch().
   api = rax_load();
 
   started = true;
+  finished = false;
+  diagnostic_start = std::chrono::steady_clock::now();
+  terminal_elapsed_ms = 0;
+  terminal_elapsed_valid = false;
+  last_progress_ms = 0;
+  last_skip_reason.clear();
+  completion_reason = "stable";
   epoch = 0;
   funcs_done = 0;
+  epoch_funcs_done = 0;
   stats = RefStats{};
   sstats = RefStats{};
   estats = EnrichStats{};
@@ -408,9 +890,44 @@ void viy_t::on_analysis_done()
   decoder_stats = DecoderAuditStats{};
   dynamic_cache.clear();
   dynamic_cache_hits = 0;
+  jobs_completed = 0;
+  jobs_cancelled = 0;
+  jobs_unavailable = 0;
+  jobs_failed = 0;
+  runs_requested = 0;
+  runs_started = 0;
+  worker_diagnostics.clear();
+  last_worker_stats = EmulationWorkerStats{};
+  worker_initialization_reported = false;
+  snapshot_stats = ProgramSnapshotStats{};
+
+  std::string start = "event=start arch=";
+  start += arch_name(arch);
+  start += " endian=";
+  start += (be ? "big" : "little");
+  start += " native=";
+  start += enabled_word(cfg.want_native);
+  start += " deobfuscation=";
+  start += enabled_word(cfg.want_deobf);
+  start += " static_requested=";
+  start += enabled_word(cfg.want_static);
+  start += " rax=";
+  start += api == nullptr ? "unavailable" : "available";
+  if ( api != nullptr && api->version_string != nullptr )
+    start += " rax_version=\"" + viy_sanitize_diagnostic(api->version_string()) + "\"";
+  start += " elapsed_ms=0";
+  log_event(ViyLogLevel::SUMMARY, start);
+  if ( api == nullptr )
+  {
+    log_event(ViyLogLevel::SUMMARY,
+              "event=diagnostic scope=rax message=\""
+            + viy_sanitize_diagnostic(rax_unavailable_reason()) + "\"");
+  }
   if ( !begin_epoch() )
   {
     started = false;
+    log_skip(last_skip_reason.empty() ? "no-applicable-analysis" :
+             last_skip_reason.c_str());
     return;
   }
   start_sweep();
@@ -439,8 +956,22 @@ uint64_t viy_t::change_count() const
 bool viy_t::begin_epoch()
 {
   stop_workers();
+  last_worker_stats = EmulationWorkerStats{};
+  worker_initialization_reported = false;
+  epoch_funcs_done = 0;
+  next = 0;
+  worker_jobs.clear();
+  waiting_for_auto = false;
 
-  viy_snapshot(img, cfg);
+  set_diagnostic_phase(ViyDiagnosticPhase::SNAPSHOTTING);
+  const uint64_t snapshot_started_ms = diagnostic_elapsed_ms();
+
+  snapshot_stats = viy_snapshot(
+      img, cfg,
+      [this](const ProgramSnapshotProgress &progress)
+      {
+        log_snapshot_progress(progress);
+      });
   assign_function_generations();
   snapshot_provider_function_starts();
   provider_generation = allocate_generation();
@@ -449,6 +980,29 @@ bool viy_t::begin_epoch()
   can_static = false;
   call_summaries = cfg.want_import_summaries
                  ? viy_collect_call_summaries() : std::vector<EmuCallSummary>{};
+  size_t chunk_count = 0;
+  for ( const FuncRange &function : img.entries )
+    chunk_count += function.chunks.size();
+  const uint64_t snapshot_finished_ms = diagnostic_elapsed_ms();
+  log_event(ViyLogLevel::SUMMARY,
+            "event=snapshot epoch=" + std::to_string(epoch + 1)
+          + "/" + std::to_string(cfg.max_epochs)
+          + " segments=" + std::to_string(snapshot_stats.segments_copied)
+          + "/" + std::to_string(snapshot_stats.segments_total)
+          + " segment_invalid=" + std::to_string(snapshot_stats.segments_invalid)
+          + " segment_read_failures="
+          + std::to_string(snapshot_stats.segments_read_failed)
+          + " functions=" + std::to_string(snapshot_stats.functions_included)
+          + "/" + std::to_string(snapshot_stats.functions_total)
+          + " functions_null=" + std::to_string(snapshot_stats.functions_null)
+          + " functions_library_or_thunk="
+          + std::to_string(snapshot_stats.functions_library_or_thunk)
+          + " functions_excluded_by_limit="
+          + std::to_string(snapshot_stats.functions_excluded_by_limit)
+          + " chunks=" + std::to_string(chunk_count)
+          + " call_summaries=" + std::to_string(call_summaries.size())
+          + " duration_ms=" + std::to_string(
+                snapshot_finished_ms - snapshot_started_ms));
   const bool can_attempt_dynamic = api != nullptr && !img.entries.empty();
   if ( can_attempt_dynamic )
   {
@@ -480,22 +1034,69 @@ bool viy_t::begin_epoch()
     can_static = cfg.want_static && api->decode != nullptr && static_arch_ok;
   }
 
+  EmulationWorkerStats initial_workers;
+  if ( worker_pool != nullptr )
+    initial_workers = worker_pool->stats();
+  std::string capabilities = "event=capabilities epoch=";
+  capabilities += std::to_string(epoch + 1) + "/" + std::to_string(cfg.max_epochs);
+  capabilities += " native=";
+  capabilities += enabled_word(can_native && native_provider != nullptr);
+  capabilities += " deobfuscation=";
+  capabilities += enabled_word(can_deobf && deobf_provider != nullptr);
+  capabilities += " dynamic=";
+  capabilities += viy_dynamic_capability_name(viy_dynamic_capability(
+      static_cast<uint64_t>(initial_workers.requested_workers),
+      static_cast<uint64_t>(initial_workers.initialized_workers),
+      static_cast<uint64_t>(initial_workers.available_workers),
+      static_cast<uint64_t>(initial_workers.unavailable_workers)));
+  capabilities += " static_decode=";
+  capabilities += enabled_word(can_static);
+  capabilities += " smir=";
+  capabilities += enabled_word(api != nullptr && api->analyze != nullptr);
+  capabilities += " hexrays=";
+  capabilities += enabled_word(hexrays.installed());
+  capabilities += " persistence=";
+  capabilities += enabled_word(cfg.persist_evidence);
+  capabilities += " workers_requested="
+      + std::to_string(initial_workers.requested_workers);
+  capabilities += " workers_initialized="
+      + std::to_string(initial_workers.initialized_workers);
+  capabilities += " workers_available="
+      + std::to_string(initial_workers.available_workers);
+  capabilities += " workers_unavailable="
+      + std::to_string(initial_workers.unavailable_workers);
+  log_event(ViyLogLevel::SUMMARY, capabilities);
+  report_worker_initialization();
+
   if ( worker_pool == nullptr && !can_static && !can_native && !can_deobf )
+  {
+    last_skip_reason = "no-applicable-provider";
     return false;
+  }
 
   // The native provider can discover the first function in an IDB that has no
   // current functions, so an empty function snapshot is not a terminal state.
   if ( img.entries.empty() && !can_native )
+  {
+    last_skip_reason = "no-functions-and-native-disabled";
     return false;
+  }
 
   if ( can_native && native_provider != nullptr )
   {
+    set_diagnostic_phase(ViyDiagnosticPhase::NATIVE_ANALYSIS);
+    const uint64_t provider_started_ms = diagnostic_elapsed_ms();
     // A provider scan is a complete snapshot. Re-emitting all current facts at
     // one externally unique generation also retires facts that disappeared.
     native_provider->reset();
     native_provider->set_epoch(provider_generation);
+    native_store_sink->reset_report();
     NativeAnalysisOptions options;
     options.max_functions = cfg.max_funcs == 0 ? 0 : size_t(cfg.max_funcs);
+    options.progress = [this](const NativeAnalysisProgress &progress)
+    {
+      log_native_progress(progress);
+    };
     NativeAnalysisStats ns = native_provider->analyze_database(options);
     native_stats.functions_scanned += ns.functions_scanned;
     native_stats.chunks_scanned += ns.chunks_scanned;
@@ -511,23 +1112,76 @@ bool viy_t::begin_epoch()
     native_stats.decode_discrepancies += ns.decode_discrepancies;
     native_stats.architecture = ns.architecture;
     native_stats.epoch = ns.epoch;
+    native_stats.register_tracker = merge_native_capability(
+        native_stats.register_tracker, ns.register_tracker);
+    native_stats.operand_address_tracker = merge_native_capability(
+        native_stats.operand_address_tracker, ns.operand_address_tracker);
+    const NativeEvidenceStoreReport &report = native_store_sink->report();
+    log_event(ViyLogLevel::SUMMARY,
+              "event=provider provider=native epoch="
+            + std::to_string(epoch + 1)
+            + " functions=" + std::to_string(ns.functions_scanned)
+            + " chunks=" + std::to_string(ns.chunks_scanned)
+            + " instructions=" + std::to_string(ns.instructions_scanned)
+            + " decode_failures=" + std::to_string(ns.decode_failures)
+            + " facts_emitted=" + std::to_string(ns.facts_emitted)
+            + " facts_inserted=" + std::to_string(report.inserted_records)
+            + " observations_added=" + std::to_string(report.added_observations)
+            + " duplicates=" + std::to_string(report.duplicate_observations)
+            + " rejected=" + std::to_string(report.rejected_facts)
+            + " register_tracker="
+            + native_capability_name(ns.register_tracker)
+            + " operand_address_tracker="
+            + native_capability_name(ns.operand_address_tracker)
+            + " duration_ms=" + std::to_string(
+                  diagnostic_elapsed_ms() - provider_started_ms));
+    if ( native_store_sink->last_error()[0] != '\0' )
+      log_event(ViyLogLevel::SUMMARY,
+                "event=diagnostic scope=native message=\""
+              + viy_sanitize_diagnostic(native_store_sink->last_error()) + "\"");
   }
 
   if ( can_deobf && deobf_provider != nullptr )
   {
+    set_diagnostic_phase(ViyDiagnosticPhase::DEOBFUSCATION_ANALYSIS);
+    const uint64_t provider_started_ms = diagnostic_elapsed_ms();
     deobf_provider->reset();
     deobf_provider->set_epoch(provider_generation);
     deobf_store_sink->set_active_generation(provider_generation);
+    deobf_store_sink->reset_report();
     DeobfAnalysisOptions options;
     options.max_functions = cfg.max_funcs == 0 ? 0 : size_t(cfg.max_funcs);
-    merge_deobf_stats(deobf_stats,
-                      deobf_provider->analyze_database(options));
+    options.progress = [this](const DeobfAnalysisProgress &progress)
+    {
+      log_deobf_progress(progress);
+    };
+    const DeobfAnalysisStats ds = deobf_provider->analyze_database(options);
+    merge_deobf_stats(deobf_stats, ds);
+    const DeobfEvidenceStoreReport &report = deobf_store_sink->report();
+    log_event(ViyLogLevel::SUMMARY,
+              "event=provider provider=deobfuscation epoch="
+            + std::to_string(epoch + 1)
+            + " functions=" + std::to_string(ds.functions_scanned)
+            + " blocks=" + std::to_string(ds.blocks_scanned)
+            + " instructions=" + std::to_string(ds.instructions_scanned)
+            + " decode_failures=" + std::to_string(ds.decode_failures)
+            + " facts_emitted=" + std::to_string(ds.facts_emitted)
+            + " facts_inserted=" + std::to_string(report.inserted_records)
+            + " observations_added=" + std::to_string(report.added_observations)
+            + " duplicates=" + std::to_string(report.duplicate_observations)
+            + " rejected=" + std::to_string(report.rejected_invalid)
+            + " contradictions=" + std::to_string(report.contradictions_suppressed)
+            + " budget_truncations=" + std::to_string(ds.budget_truncations)
+            + " duration_ms=" + std::to_string(
+                  diagnostic_elapsed_ms() - provider_started_ms));
+    if ( deobf_store_sink->last_error()[0] != '\0' )
+      log_event(ViyLogLevel::SUMMARY,
+                "event=diagnostic scope=deobfuscation message=\""
+              + viy_sanitize_diagnostic(deobf_store_sink->last_error()) + "\"");
   }
 
-  next = 0;
-  worker_jobs.clear();
-  waiting_for_auto = false;
   epoch_change_base = change_count();
+  set_diagnostic_phase(ViyDiagnosticPhase::SWEEPING_FUNCTIONS);
   return true;
 }
 
@@ -537,12 +1191,24 @@ void viy_t::start_sweep()
   timer = register_timer(cfg.tick_ms, viy_sweep_cb, this);
   if ( timer == nullptr )
   {
+    log_event(ViyLogLevel::SUMMARY,
+              "event=scheduler mode=inline tick_ms="
+            + std::to_string(cfg.tick_ms)
+            + " functions_per_tick=" + std::to_string(cfg.funcs_per_tick));
     // No UI timer available (e.g. headless idalib): run to completion inline.
     inline_mode = true;
     while ( process_batch(cfg.funcs_per_tick ) )
       ; // keep going
     inline_mode = false;
     finish();
+  }
+  else
+  {
+    log_event(ViyLogLevel::SUMMARY,
+              "event=scheduler mode=timer tick_ms="
+            + std::to_string(cfg.tick_ms)
+            + " functions_per_tick=" + std::to_string(cfg.funcs_per_tick));
+    emit_status(true);
   }
 }
 
@@ -665,6 +1331,7 @@ void viy_t::process_function(size_t index, EmulationJobResult result)
                                chunk.start, chunk.end, cfg, sstats);
   }
   ++funcs_done;
+  ++epoch_funcs_done;
 }
 
 //-----------------------------------------------------------------------------
@@ -672,7 +1339,9 @@ void viy_t::stop_workers()
 {
   if ( worker_pool != nullptr )
   {
+    last_worker_stats = worker_pool->stats();
     worker_pool->shutdown();
+    last_worker_stats = worker_pool->stats();
     worker_pool.reset();
   }
   worker_jobs.clear();
@@ -687,17 +1356,26 @@ bool viy_t::process_batch(int count)
     if ( !auto_is_ok() )
     {
       if ( !inline_mode )
+      {
+        emit_status();
         return true;
+      }
       auto_wait();
     }
     ++epoch;
     if ( !begin_epoch() )
+    {
+      completion_reason = last_skip_reason.empty()
+                        ? "no-applicable-analysis" : last_skip_reason;
+      log_skip(completion_reason.c_str());
       return false;
+    }
   }
 
   const size_t budget = size_t(std::max(count, 1));
   if ( worker_pool != nullptr )
   {
+    report_worker_initialization();
     size_t applied = 0;
     auto apply_one = [&](EmulationJobResult result)
     {
@@ -730,6 +1408,7 @@ bool viy_t::process_batch(int count)
       {
         dynamic_cache[result.function_start] = info.fingerprint;
       }
+      record_worker_result(result, info.requested_runs);
       process_function(index, std::move(result));
       ++applied;
     };
@@ -758,9 +1437,11 @@ bool viy_t::process_batch(int count)
         continue;
       }
       uint64_t ticket = 0;
+      const size_t requested_runs_count = job.runs.size();
       if ( !worker_pool->try_submit(std::move(job), &ticket) )
         break; // bounded queue backpressure; retry on the next timer tick
-      worker_jobs.emplace(ticket, WorkerJobInfo{ next, fingerprint });
+      worker_jobs.emplace(ticket,
+                          WorkerJobInfo{ next, fingerprint, requested_runs_count });
       ++next;
       ++submitted;
     }
@@ -779,7 +1460,10 @@ bool viy_t::process_batch(int count)
     }
 
     if ( next < img.entries.size() || !worker_jobs.empty() )
+    {
+      emit_status();
       return true;
+    }
   }
   else
   {
@@ -793,18 +1477,32 @@ bool viy_t::process_batch(int count)
       process_function(next, std::move(empty));
     }
     if ( next < img.entries.size() )
+    {
+      emit_status();
       return true;
+    }
   }
 
   // Release per-worker engines and their immutable snapshot before applying
   // producer-neutral facts or waiting for the next autoanalysis epoch.
+  report_worker_initialization();
+  set_diagnostic_phase(ViyDiagnosticPhase::APPLYING_EVIDENCE);
+  emit_status(true);
   stop_workers();
 
   // Apply producer-neutral facts only after all providers have completed the
   // epoch.  The consumer is contradiction-aware and confidence-gated, and its
   // mutations participate in the convergence test below.
   const analysis::EvidenceStore active_evidence = active_evidence_view();
-  const EvidenceApplyStats applied = viy_apply_evidence(active_evidence, cfg);
+  const uint64_t evidence_apply_started_ms = diagnostic_elapsed_ms();
+  const EvidenceApplyStats applied = viy_apply_evidence(
+      active_evidence, cfg,
+      [this](const EvidenceApplyProgress &progress)
+      {
+        log_evidence_progress(progress);
+      });
+  const uint64_t evidence_apply_duration_ms =
+      diagnostic_elapsed_ms() - evidence_apply_started_ms;
   evidence_stats.refs.crefs += applied.refs.crefs;
   evidence_stats.refs.drefs += applied.refs.drefs;
   evidence_stats.refs.code_made += applied.refs.code_made;
@@ -813,28 +1511,127 @@ bool viy_t::process_batch(int count)
   evidence_stats.records_considered += applied.records_considered;
   evidence_stats.records_conflicted += applied.records_conflicted;
   evidence_stats.records_below_policy += applied.records_below_policy;
+  evidence_stats.conflict_relations_examined +=
+      applied.conflict_relations_examined;
+  evidence_stats.conflict_digests_computed +=
+      applied.conflict_digests_computed;
+
+  log_event(ViyLogLevel::SUMMARY,
+            "event=evidence-apply epoch=" + std::to_string(epoch + 1)
+          + " records=" + std::to_string(active_evidence.record_count())
+          + " observations=" + std::to_string(active_evidence.observation_count())
+          + " considered=" + std::to_string(applied.records_considered)
+          + " conflicted=" + std::to_string(applied.records_conflicted)
+          + " below_policy=" + std::to_string(applied.records_below_policy)
+          + " contradiction_relations="
+          + std::to_string(applied.conflict_relations_examined)
+          + " contradiction_digests="
+          + std::to_string(applied.conflict_digests_computed)
+          + " code_refs=" + std::to_string(applied.refs.crefs)
+          + " data_refs=" + std::to_string(applied.refs.drefs)
+          + " code_created=" + std::to_string(applied.refs.code_made)
+          + " functions_created=" + std::to_string(applied.functions_created)
+          + " comments_added=" + std::to_string(applied.comments_added)
+          + " duration_ms=" + std::to_string(evidence_apply_duration_ms));
 
   if ( cfg.want_hexrays_bridge )
+  {
     hexrays.publish(active_evidence);
+    const HexRaysBridgeStats hs = hexrays.stats();
+    log_event(ViyLogLevel::SUMMARY,
+              "event=hexrays-publish installed="
+            + std::string(enabled_word(hexrays.installed()))
+            + " records_considered=" + std::to_string(hs.records_considered)
+            + " records_accepted=" + std::to_string(hs.records_accepted)
+            + " annotations=" + std::to_string(hs.annotations_built)
+            + " conflicted=" + std::to_string(hs.records_conflicted)
+            + " below_policy=" + std::to_string(hs.records_below_policy)
+            + " callback_failures=" + std::to_string(hs.callback_failures));
+  }
 
   if ( cfg.persist_evidence )
   {
-    std::string ignored;
-    evidence.persist(evidence_adapter, &ignored);
+    std::string persist_error;
+    const bool persisted = evidence.persist(evidence_adapter, &persist_error);
+    std::string line = "event=persistence operation=write result=";
+    line += persisted ? "ok" : "error";
+    line += " records=" + std::to_string(evidence.record_count());
+    line += " observations=" + std::to_string(evidence.observation_count());
+    if ( !persist_error.empty() )
+      line += " message=\"" + viy_sanitize_diagnostic(persist_error) + "\"";
+    log_event(ViyLogLevel::SUMMARY, line);
   }
 
   const bool changed = change_count() > epoch_change_base;
   if ( changed && epoch + 1 < cfg.max_epochs )
   {
     waiting_for_auto = true;
+    completion_reason = "converging";
+    set_diagnostic_phase(ViyDiagnosticPhase::WAITING_FOR_CONVERGENCE,
+                         "database mutations queued autoanalysis");
+    emit_status(true);
     return true;
   }
+  completion_reason = changed ? "max-epochs-reached" : "stable";
   return false;
 }
 
 //-----------------------------------------------------------------------------
 void viy_t::finish()
 {
+  finished = true;
+  terminal_elapsed_ms = current_diagnostic_elapsed_ms();
+  terminal_elapsed_valid = true;
+  set_diagnostic_phase(ViyDiagnosticPhase::COMPLETE, completion_reason.c_str());
+  emit_status(true, ViyLogLevel::SUMMARY);
+
+  log_event(ViyLogLevel::SUMMARY,
+            "event=complete reason=" + completion_reason
+          + " epochs=" + std::to_string(epoch + 1)
+          + " function_passes=" + std::to_string(funcs_done)
+          + " evidence_records=" + std::to_string(evidence.record_count())
+          + " evidence_observations=" + std::to_string(evidence.observation_count())
+          + " mutation_operations=" + std::to_string(change_count())
+          + " jobs_completed=" + std::to_string(jobs_completed)
+          + " jobs_cancelled=" + std::to_string(jobs_cancelled)
+          + " jobs_unavailable=" + std::to_string(jobs_unavailable)
+          + " jobs_failed=" + std::to_string(jobs_failed)
+          + " runs_started=" + std::to_string(runs_started)
+          + "/" + std::to_string(runs_requested)
+          + " dynamic=" + std::string(viy_dynamic_capability_name(
+                viy_dynamic_capability(
+                    static_cast<uint64_t>(last_worker_stats.requested_workers),
+                    static_cast<uint64_t>(last_worker_stats.initialized_workers),
+                    static_cast<uint64_t>(last_worker_stats.available_workers),
+                    static_cast<uint64_t>(last_worker_stats.unavailable_workers))))
+          + " workers_available="
+          + std::to_string(last_worker_stats.available_workers)
+          + "/" + std::to_string(last_worker_stats.requested_workers)
+          + " workers_unavailable="
+          + std::to_string(last_worker_stats.unavailable_workers)
+          + " cache_hits=" + std::to_string(dynamic_cache_hits)
+          + " native_facts=" + std::to_string(native_stats.facts_emitted)
+          + " deobfuscation_facts=" + std::to_string(deobf_stats.facts_emitted)
+          + " dynamic_observations=" + std::to_string(bridge_stats.added_observations)
+          + " decoder_compared=" + std::to_string(decoder_stats.instructions_compared)
+          + " decoder_disagreements=" + std::to_string(
+                decoder_stats.size_disagreements
+              + decoder_stats.flow_disagreements
+              + decoder_stats.target_disagreements)
+          + " evidence_conflicted=" + std::to_string(
+                evidence_stats.records_conflicted)
+          + " evidence_below_policy=" + std::to_string(
+                evidence_stats.records_below_policy)
+          + " elapsed_ms=" + std::to_string(diagnostic_elapsed_ms()));
+
+  for ( const auto &entry : worker_diagnostics )
+  {
+    log_event(ViyLogLevel::SUMMARY,
+              "event=diagnostic scope=worker count="
+            + std::to_string(entry.second)
+            + " message=\"" + entry.first + "\"");
+  }
+
   const unsigned long long ind_c = (unsigned long long)stats.crefs;   // indirect (emulated)
   const unsigned long long dir_c = (unsigned long long)sstats.crefs;  // direct (static decode)
   const unsigned long long ev_c  = (unsigned long long)evidence_stats.refs.crefs;
@@ -852,8 +1649,10 @@ void viy_t::finish()
   const unsigned long long nr    = (unsigned long long)astats.norets;
   const unsigned long long ar    = (unsigned long long)astats.argregs;
   const unsigned long long op    = (unsigned long long)astats.opaque;
-  if ( ind_c || dir_c || ev_c || drefs || ptrs || typed || strs || cmts || sw || pg || nr || ar || op
+  if ( log_at_least(ViyLogLevel::SUMMARY)
+    && (ind_c || dir_c || ev_c || drefs || ptrs || typed || strs || cmts || sw || pg || nr || ar || op
     || fn || smc )
+  )
   {
     const char *rv = (api != nullptr && api->version_string != nullptr)
                    ? api->version_string() : "none";
@@ -874,10 +1673,23 @@ void viy_t::finish()
 //-----------------------------------------------------------------------------
 bool idaapi viy_t::run(size_t)
 {
-  // Hidden plugin: normally driven by auto_empty_finally. If invoked manually
-  // (e.g. via the plugin API), kick off the sweep if it has not run yet.
+  // Normally driven by auto_empty_finally. Manual invocation must not bypass
+  // that database-consistency boundary: while autoanalysis is active it only
+  // reports the waiting state. Once the database is settled, it either starts
+  // the sweep or prints an immediate status snapshot to the Output window.
   if ( !started )
+  {
+    if ( !auto_is_ok() )
+    {
+      emit_status(true, ViyLogLevel::SUMMARY);
+      return true;
+    }
     on_analysis_done();
+    if ( !started )
+      return true; // on_analysis_done() emitted the exact skip reason
+  }
+  if ( started )
+    emit_status(true, ViyLogLevel::SUMMARY);
   return true;
 }
 
@@ -891,11 +1703,11 @@ static plugmod_t *idaapi init()
 plugin_t PLUGIN =
 {
   IDP_INTERFACE_VERSION,
-  PLUGIN_MULTI | PLUGIN_MOD | PLUGIN_HIDE, // per-IDB, changes DB, invisible in menus
+  PLUGIN_MULTI | PLUGIN_MOD, // per-IDB; visible entry prints the live status
   init,
   nullptr, // term  (must be nullptr for PLUGIN_MULTI)
   nullptr, // run   (must be nullptr for PLUGIN_MULTI; plugmod_t::run is used)
-  "viy: recover indirect xrefs the analysis missed, via rax emulation",
-  "",
+  "viy: recover missed analysis facts and report live progress",
+  "Print the current viy analysis status or start the sweep",
   "viy",
 };

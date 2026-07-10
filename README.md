@@ -1,6 +1,6 @@
 # viy
 
-viy is a hidden, per-database IDA plugin that combines IDA-native analysis with
+viy is a per-database IDA plugin that combines IDA-native analysis with
 optional [rax](https://github.com/hexrayssa/rax) decoding and emulation. Its goal
 is to recover useful analysis evidence that the initial disassembly missed while
 keeping speculative results distinguishable from proofs.
@@ -45,8 +45,9 @@ independently.
 | rax 1.3+ | The decoder audit additionally calls optional `rax_analyze` at existing code heads and records statically resolved SMIR effects. Rich effects are currently defined by the vendored ABI for x86-64, AArch64, RISC-V 64, and Hexagon; other valid decode modes report unsupported/partial effects. |
 
 If librax fails the ABI/symbol gate, only rax-backed paths are unavailable. The
-native provider is not disabled with them. viy remains quiet unless it actually
-applies a finding.
+native provider is not disabled with them. viy reports the capability decision,
+analysis phases, bounded progress, evidence policy results, and completion in
+IDA's Output window and headless log.
 
 ## Lifecycle and data flow
 
@@ -393,7 +394,7 @@ ctest --test-dir build-dev --output-on-failure
 ```
 
 `-DVIY_TEST_SANITIZERS=ON` adds AddressSanitizer and UndefinedBehaviorSanitizer
-to the 13 IDA-free test targets. The two serial licensed real-IDAT integration
+to the 14 IDA-free test targets. The two serial licensed real-IDAT integration
 targets (persistence/provider recovery and Hex-Rays rendering) are opt-in via
 `-DVIY_IDA_INTEGRATION_TESTS=ON -DVIY_IDAT=/path/to/idat`.
 
@@ -427,6 +428,41 @@ librax search order is:
 
 5. next to the IDA executable.
 
+## Runtime observability
+
+By default viy writes bounded, non-modal `[viy]` records to IDA's Output window.
+The same records are present in an IDAT `-L` log. Stable `event=` and
+`key=value` fields expose loading/restoration, capability gates, snapshot and
+provider durations, exact snapshot inclusion/exclusion/read-failure counts,
+worker initialization/availability and queue depth, per-epoch function progress,
+cache hits, dynamic-job outcomes, evidence-planning/mutation progress,
+conflicts/policy skips, persistence, convergence, and terminal state. A
+successful run that changes nothing still emits a completion record.
+
+Periodic status is limited by `VIY_PROGRESS_INTERVAL_MS`; phase and terminal
+records are emitted immediately. Function addresses and individual worker
+outcomes appear only at trace level. Free-form diagnostics are single-line and
+bounded. Logging is performed on the main thread and is not part of emulation
+job fingerprints or persisted evidence identities. Terminal elapsed time is
+frozen, so later manual status requests do not include post-analysis idle time.
+Dynamic capability uses `off`, `initializing`, `available`, `partial`, or
+`unavailable`; native register-value and operand-address trackers are reported
+independently as `unknown`, `available`, or `unavailable` where applicable.
+
+`VIY_LOG_LEVEL` selects the surface:
+
+| Level | Output |
+|---:|---|
+| `0` | No viy output. |
+| `1` | Lifecycle, capability/provider results, diagnostics, evidence policy, persistence, and completion. |
+| `2` | Level 1 plus rate-limited live progress; this is the default. |
+| `3` | Level 2 plus per-function worker status, run counts, edge counts, and data-access counts. |
+
+The plugin is visible in IDA's plugin menu. Invoking it while analysis is active
+or complete prints an immediate status snapshot. Before IDA autoanalysis has
+settled, invocation reports the waiting state without starting the sweep; after
+that boundary it triggers the normal guarded start path if needed.
+
 ## Runtime configuration
 
 Environment variables are read when each per-IDB plugin instance is created.
@@ -440,6 +476,8 @@ documented clamps are applied.
 | Variable | Default | Meaning and enforced bounds |
 |---|---:|---|
 | `VIY_ENABLED` | `1` | Master sweep switch. Evidence restore still occurs when disabled. |
+| `VIY_LOG_LEVEL` | `2` | `0` quiet, `1` lifecycle/summary, `2` bounded progress, `3` per-function trace. Valid values above 3 are capped at 3; negative or malformed values retain the default as described above. |
+| `VIY_PROGRESS_INTERVAL_MS` | `1000` | Periodic progress cadence in milliseconds; zero resets to 1000 and nonzero values are clamped to 100–60000. |
 | `VIY_MAX_INSNS` | `200000` | Instruction cap per emulation run. `0` is reset to `200000`. |
 | `VIY_TIMEOUT_MS` | `1000` | Wall-clock cap per run. `0` is reset to `1000`. |
 | `VIY_MAX_FUNCS` | `0` | Snapshot/scan at most N functions; `0` means all. |

@@ -1603,12 +1603,52 @@ struct DeobfAnalysisProvider::Impl
     stats.architecture = architecture;
     stats.epoch = current_epoch;
     if ( architecture == Architecture::Unsupported )
+    {
+      if ( options.progress )
+      {
+        DeobfAnalysisProgress event;
+        event.stage = DeobfAnalysisProgressStage::COMPLETE;
+        event.stage_boundary = true;
+        options.progress(event);
+      }
       return stats;
+    }
     const size_t count = get_func_qty();
     const size_t limit = options.max_functions == 0
                        ? count : std::min(count, options.max_functions);
+    if ( options.progress )
+    {
+      DeobfAnalysisProgress event;
+      event.functions_total = limit;
+      event.stage_boundary = true;
+      options.progress(event);
+    }
     for ( size_t i = 0; i < limit; ++i )
+    {
       analyze_one(stats, getn_func(i), options);
+      if ( options.progress )
+      {
+        DeobfAnalysisProgress event;
+        event.functions_completed = i + 1;
+        event.functions_total = limit;
+        event.instructions_scanned = stats.instructions_scanned;
+        event.blocks_scanned = stats.blocks_scanned;
+        event.facts_emitted = stats.facts_emitted;
+        options.progress(event);
+      }
+    }
+    if ( options.progress )
+    {
+      DeobfAnalysisProgress event;
+      event.stage = DeobfAnalysisProgressStage::COMPLETE;
+      event.functions_completed = limit;
+      event.functions_total = limit;
+      event.instructions_scanned = stats.instructions_scanned;
+      event.blocks_scanned = stats.blocks_scanned;
+      event.facts_emitted = stats.facts_emitted;
+      event.stage_boundary = true;
+      options.progress(event);
+    }
     return stats;
   }
 
@@ -1622,9 +1662,36 @@ struct DeobfAnalysisProvider::Impl
     if ( architecture == Architecture::Unsupported
       || any_ea > uint64_t(BADADDR) )
     {
+      if ( options.progress )
+      {
+        DeobfAnalysisProgress event;
+        event.stage = DeobfAnalysisProgressStage::COMPLETE;
+        event.stage_boundary = true;
+        options.progress(event);
+      }
       return stats;
     }
-    analyze_one(stats, get_func(ea_t(any_ea)), options);
+    func_t *function = get_func(ea_t(any_ea));
+    if ( options.progress )
+    {
+      DeobfAnalysisProgress event;
+      event.functions_total = function == nullptr ? 0 : 1;
+      event.stage_boundary = true;
+      options.progress(event);
+    }
+    analyze_one(stats, function, options);
+    if ( options.progress )
+    {
+      DeobfAnalysisProgress event;
+      event.stage = DeobfAnalysisProgressStage::COMPLETE;
+      event.functions_completed = function == nullptr ? 0 : 1;
+      event.functions_total = function == nullptr ? 0 : 1;
+      event.instructions_scanned = stats.instructions_scanned;
+      event.blocks_scanned = stats.blocks_scanned;
+      event.facts_emitted = stats.facts_emitted;
+      event.stage_boundary = true;
+      options.progress(event);
+    }
     return stats;
   }
 };

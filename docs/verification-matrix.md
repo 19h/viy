@@ -68,10 +68,11 @@ configuration:
 
 | CTest name | Source tests | What it directly proves |
 |---|---|---|
-| `viy.evidence` | `tests/evidence_store_test.cpp`: `test_sha256`, `test_every_payload_codec`, `test_validation`, `test_decoder_robustness`, `test_dedup_merge_and_determinism`, `test_generation_lifecycle_regression`, `test_latest_generation_view`, `test_conflicts`, `test_persistence_adapter` | Standard SHA-256 vectors; all 13 payload codecs; normalization/validation; transactional bounded decoding; deterministic merge/serialization; copy/move/generation regression; general historical latest-generation view; conflict classes; abstract persistence errors and replace/merge behavior. |
+| `viy.evidence` | `tests/evidence_store_test.cpp`: `test_sha256`, `test_every_payload_codec`, `test_validation`, `test_decoder_robustness`, `test_dedup_merge_and_determinism`, `test_generation_lifecycle_regression`, `test_latest_generation_view`, `test_conflicts`, `test_persistence_adapter` | Standard SHA-256 vectors; all 13 payload codecs; normalization/validation; transactional bounded decoding; deterministic merge/serialization; copy/move/generation regression; general historical latest-generation view; every conflict class; exact fast-vs-exhaustive contradiction-set equivalence including asymmetric dispatch and cross-payload CFG cases; abstract persistence errors and replace/merge behavior. |
 | `viy.evidence_lifecycle` | `tests/evidence_lifecycle_test.cpp`: allocator, exact-active-policy, and disappearance tests | Collision-free generation allocation across restored values including `UINT64_MAX`; exact provider/function authority; removed/out-of-scope/unscoped handling; user-assertion retention; historical immutability; retirement without tombstones. |
-| `viy.evidence_apply_policy` | `tests/evidence_apply_policy_test.cpp`: all payload/action, code-target, proof-threshold, dynamic-corroboration, function, branch, contradiction, and non-contradictory-conflict tests | All 13 payload variants and target kinds; exact 9000/8000/7500 boundaries; two-run corroboration; configuration gates; contradiction suppression; and preservation of mere ambiguity/variation. |
+| `viy.evidence_apply_policy` | `tests/evidence_apply_policy_test.cpp`: all payload/action, code-target, proof-threshold, dynamic-corroboration, function, branch, contradiction, non-contradictory-conflict, and high-cardinality fast-path tests | All 13 payload variants and target kinds; exact 9000/8000/7500 boundaries; two-run corroboration; configuration gates; contradiction suppression; preservation of mere ambiguity/variation; and 2048 distinct register-value variants producing 2048 decisions with zero contradiction pair checks/digests. |
 | `viy.config` | `tests/viy_config_test.cpp` | Defaults; exact false tokens; boolean overrides; C-style integer prefixes; whitespace; overflow, negative, empty, and trailing-junk rejection; zero fallbacks; and every numeric clamp. |
+| `viy.diagnostics` | `tests/diagnostics_test.cpp` | Stable phase/capability names and key/value formatting; all dynamic worker states; initialized/unavailable gauges; zero-total status; exact 999/1000 ms rate boundary; forced/backwards-time behavior; and bounded single-line diagnostic sanitization/truncation. |
 | `viy.emulation_workers` | `tests/emulation_workers_test.cpp`: `test_ordered_delivery`, `test_generation_cancellation`, `test_unavailable_and_backpressure`, `test_cooperative_shutdown`, plus fingerprint assertions | Worker-count bounds, out-of-order completion with in-order delivery, ticket monotonicity, generation cancellation/reuse, unavailable executor settlement, bounded-queue backpressure, cooperative shutdown/join, and deterministic job-fingerprint invalidation. |
 | `viy.emu_evidence` | `tests/emu_evidence_test.cpp`: normalization, evidence bridge, real summaries, and real-engine policy tests | Deterministic event normalization; image-only evidence projection; target endianness/register byte order; call/CFG/outcome facts; real x86-64 and i386 summaries; same-engine run isolation; strict RX-write/RW-execute denial with permissive controls; exact instruction-budget termination; jump/return classification; and decode-unavailable `Unknown` fallback. |
 | `viy.abi_policy` | `tests/abi_policy_test.cpp` | Shared SysV64, Win64, i386, AAPCS32/64, RISC-V 64, Cortex-M, and Hexagon layouts; register/stack placement and endianness; Win64 home-area/fifth-argument placement; overrides and invalid plans; deterministic scalar/image/stack/mixed corpus; large-count wrapping and address-overflow guards. |
@@ -94,18 +95,20 @@ licensed targets:
 
 | CTest name | Direct coverage |
 |---|---|
-| `viy.ida_evidence_persistence` | Multi-process A/B netnode commit/recovery/migration; disabled-sweep restore; actual dynamic-cache hit; absolute no-dref gate; and separate native/deobf producer provenance with the companion librax physically absent. |
-| `viy.ida_hexrays_bridge` | Real Hex-Rays initialization, native-evidence publication, warning callback/rendering, a live recent cfunc through plug-in teardown, and clean `qexit`; successful skip only when a compatible licensed decompiler is unavailable. |
+| `viy.ida_evidence_persistence` | Multi-process A/B netnode commit/recovery/migration; disabled-sweep restore; actual dynamic-cache hit; absolute no-dref gate; separate native/deobf producer provenance with the companion librax physically absent; levels 0/1/2/3; ordered phases/subphases; exhaustive snapshot accounting; exact worker/run/cache taxonomy; early-manual autoanalysis guard; and frozen delayed terminal snapshots. |
+| `viy.ida_hexrays_bridge` | Real Hex-Rays initialization, native-evidence publication, warning callback/rendering, a live recent cfunc through plug-in teardown, structured lifecycle/subphase invariants, and clean `qexit`; successful skip only when a compatible licensed decompiler is unavailable. |
 
-## Audit execution on 2026-07-09
+## Audit execution on 2026-07-10
 
 The following commands were run against the implementation documented here:
 
 | Check | Result |
 |---|---|
 | Release plugin build against IDA SDK 9.3 with `VIY_TEST_STRICT_WARNINGS=ON` | Passed; `build-dev/viy.dylib` linked. |
-| IDA-free CTest in `build-dev` | 13/13 passed. The generated CTest file set `VIY_REQUIRE_RAX_TESTS=1` and the release librax path for emulation, SMIR, and decoder-core targets, so their real rax portions did not silently skip. |
-| Debug ASan/UBSan build with strict pure-test warnings in `build-sanitize` | 13/13 passed with `ASAN_OPTIONS=detect_leaks=0`. |
+| IDA-free CTest in `build-dev` | 14/14 passed. The generated CTest file set `VIY_REQUIRE_RAX_TESTS=1` and the release librax path for emulation, SMIR, and decoder-core targets, so their real rax portions did not silently skip. |
+| Complete CTest in `build-dev`, including licensed integration targets | 16/16 passed. Both real-IDAT workflows asserted the structured start and completion lifecycle records. |
+| Debug ASan/UBSan build with strict pure-test warnings in `build-sanitize` | 14/14 passed with `ASAN_OPTIONS=detect_leaks=0`. |
+| GCC 15 release-mode compile/run with `-O3 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror` | Passed for diagnostics, configuration, and emulation-worker tests. |
 | `cargo test -p rax-capi --manifest-path vendor/rax/Cargo.toml` | 53/53 passed, plus 0 doc tests. |
 | `BUILD_DIR=build-dev tests/run_ida_evidence_persistence.sh` | Passed multi-process real-IDAT restore/corruption/marker/legacy phases, actual dynamic-cache reuse, the `VIY_WANT_DREFS=0` gate, and separate native/deobf no-librax producer-provenance runs. |
 | `BUILD_DIR=build-dev tests/run_ida_hexrays_bridge.sh` | Passed with Hex-Rays 9.4: a real `[viy]` native-evidence warning rendered at 100% confidence, its cfunc remained live through `qexit`, and callback teardown completed cleanly. |

@@ -113,7 +113,7 @@ def _start():
     global _TARGET_EA
     ida_auto.auto_wait()
 
-    # Kick hidden PLUGIN_MULTI explicitly in case this freshly-created IDB was
+    # Kick PLUGIN_MULTI explicitly in case this freshly-created IDB was
     # already auto-analyzed before viy's listener observed auto_empty_finally.
     if not ida_loader.load_and_run_plugin("viy", 0):
         raise AssertionError("could not load/run the staged viy plugin")

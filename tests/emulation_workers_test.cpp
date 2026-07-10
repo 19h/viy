@@ -240,6 +240,7 @@ void test_unavailable_and_backpressure()
   });
   CHECK(unavailable.wait_for_initialization(2s));
   CHECK(!unavailable.usable());
+  CHECK(unavailable.initialization_diagnostic() == "intentional");
   uint64_t ticket = 0;
   CHECK(unavailable.try_submit(job(9), &ticket));
   EmulationJobResult result;
@@ -311,6 +312,9 @@ int main()
   fingerprint_run.run_id = 3;
   fingerprint_job.runs.push_back(fingerprint_run);
   const uint64_t first = viy_emulation_job_fingerprint(fingerprint_job, 9, {});
+  CHECK(first == viy_emulation_job_fingerprint(fingerprint_job, 9, {}));
+  fingerprint_job.config.log_level = ViyLogLevel::TRACE;
+  fingerprint_job.config.progress_interval_ms = 60000;
   CHECK(first == viy_emulation_job_fingerprint(fingerprint_job, 9, {}));
   fingerprint_job.runs[0].seed = 8;
   CHECK(first != viy_emulation_job_fingerprint(fingerprint_job, 9, {}));

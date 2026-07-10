@@ -14,7 +14,8 @@ namespace {
             << ": " #expr "\n"; std::abort(); } } while ( false )
 
 const std::vector<const char *> variables = {
-  "VIY_ENABLED", "VIY_MAX_INSNS", "VIY_TIMEOUT_MS", "VIY_MAX_FUNCS",
+  "VIY_ENABLED", "VIY_LOG_LEVEL", "VIY_PROGRESS_INTERVAL_MS",
+  "VIY_MAX_INSNS", "VIY_TIMEOUT_MS", "VIY_MAX_FUNCS",
   "VIY_FUNCS_PER_TICK", "VIY_TICK_MS", "VIY_MAX_EPOCHS",
   "VIY_EXPLORE_RUNS", "VIY_WORKERS", "VIY_MAKE_CODE", "VIY_WANT_DREFS",
   "VIY_STATIC", "VIY_NATIVE", "VIY_DEOBF", "VIY_PERSIST_EVIDENCE",
@@ -51,6 +52,8 @@ void test_defaults_and_booleans()
   clear_environment();
   const ViyConfig defaults = viy::viy_load_config();
   CHECK(defaults.enabled && defaults.want_native && defaults.want_deobf);
+  CHECK(defaults.log_level == viy::ViyLogLevel::PROGRESS
+        && defaults.progress_interval_ms == 1000);
   CHECK(defaults.max_insns == 200000 && defaults.timeout_ms == 1000);
   CHECK(defaults.funcs_per_tick == 2 && defaults.tick_ms == 15);
   CHECK(defaults.max_epochs == 3 && defaults.explore_runs == 4);
@@ -86,6 +89,8 @@ void test_numeric_validation_and_bounds()
   set("VIY_WORKERS", "999");
   set("VIY_OPAQUE_RUNS", "1");
   set("VIY_MAX_RUNTIME_BYTES", "18446744073709551615");
+  set("VIY_LOG_LEVEL", "99");
+  set("VIY_PROGRESS_INTERVAL_MS", "1");
   const ViyConfig bounded = viy::viy_load_config();
   CHECK(bounded.max_insns == 200000 && bounded.timeout_ms == 1000);
   CHECK(bounded.max_funcs == 0x20);
@@ -93,6 +98,29 @@ void test_numeric_validation_and_bounds()
   CHECK(bounded.max_epochs == 16 && bounded.explore_runs == 64);
   CHECK(bounded.workers == 64 && bounded.opaque_runs == 2);
   CHECK(bounded.max_runtime_bytes == 64ull * 1024 * 1024);
+  CHECK(bounded.log_level == viy::ViyLogLevel::TRACE
+        && bounded.progress_interval_ms == 100);
+
+  clear_environment();
+  set("VIY_LOG_LEVEL", "bogus");
+  set("VIY_PROGRESS_INTERVAL_MS", "999999");
+  const ViyConfig diagnostic_bounds = viy::viy_load_config();
+  CHECK(diagnostic_bounds.log_level == viy::ViyLogLevel::PROGRESS);
+  CHECK(diagnostic_bounds.progress_interval_ms == 60000);
+
+  for ( int level = 0; level <= 3; ++level )
+  {
+    clear_environment();
+    const std::string value = std::to_string(level);
+    set("VIY_LOG_LEVEL", value.c_str());
+    CHECK(int(viy::viy_load_config().log_level) == level);
+  }
+  clear_environment();
+  set("VIY_LOG_LEVEL", "-1");
+  set("VIY_PROGRESS_INTERVAL_MS", "0");
+  const ViyConfig diagnostic_fallbacks = viy::viy_load_config();
+  CHECK(diagnostic_fallbacks.log_level == viy::ViyLogLevel::PROGRESS);
+  CHECK(diagnostic_fallbacks.progress_interval_ms == 1000);
 
   for ( const char *bad : {"-1", "12junk", "", "   ",
                             "18446744073709551616"} )

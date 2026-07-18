@@ -147,6 +147,49 @@ def verify_common(records, level):
             if operand_state not in ("available", "unavailable"):
                 fail("native operand-address tracker was not probed")
 
+    capabilities = events(records, "capabilities")
+    if not capabilities:
+        fail("no capability record")
+    snapshot_functions = {
+        snapshot.get("epoch"): ratio(snapshot, "functions")[0]
+        for snapshot in events(records, "snapshot")
+    }
+    for capability in capabilities:
+        policy = capability.get("workers_policy")
+        configured = integer(capability, "workers_configured")
+        hardware = integer(capability, "workers_hardware_threads")
+        automatic_cap = integer(capability, "workers_auto_cap")
+        selected = integer(capability, "workers_selected")
+        requested = integer(capability, "workers_requested")
+        if min(configured, hardware, selected, requested) < 0:
+            fail("negative worker-selection value")
+        if automatic_cap != 4:
+            fail("unexpected automatic worker cap")
+        if selected != requested:
+            fail("selected and requested worker counts disagree")
+        if policy == "auto":
+            if configured != 0 or selected > automatic_cap:
+                fail("automatic worker selection violates its cap")
+        elif policy == "explicit":
+            if configured == 0 or selected > configured:
+                fail("explicit worker selection violates configuration")
+        else:
+            fail("invalid worker selection policy")
+        dynamic_capability = capability.get("dynamic")
+        if dynamic_capability == "off" and selected != 0:
+            fail("dynamic=off selected workers")
+        if dynamic_capability != "off":
+            functions = snapshot_functions.get(capability.get("epoch"))
+            if functions is None or functions <= 0:
+                fail("dynamic capability has no nonempty function snapshot")
+            if policy == "auto":
+                expected_selected = min(
+                    max(hardware - 1, 1), automatic_cap, functions)
+            else:
+                expected_selected = min(configured, functions)
+            if selected != expected_selected:
+                fail("worker selection does not match declared policy")
+
     function_passes = integer(terminal, "function_passes")
     jobs = sum(integer(terminal, key) for key in
                ("jobs_completed", "jobs_cancelled", "jobs_unavailable", "jobs_failed"))

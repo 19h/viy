@@ -121,6 +121,13 @@ struct EmulationWorkerStats
 // one) and caps the automatic choice at four. Each engine owns a full mapped
 // image plus a baseline snapshot, so an unbounded CPU-count default would cause
 // severe memory amplification on large IDBs.
+inline constexpr size_t kViyAutomaticWorkerCap = 4;
+
+// Deterministic form used when the caller needs to report the exact hardware
+// value behind an automatic selection and by tests covering the policy.
+size_t viy_resolve_worker_count_for_hardware(
+    int configured, unsigned reported_hardware_concurrency,
+    size_t hard_cap = 64);
 size_t viy_resolve_worker_count(int configured, size_t hard_cap = 64);
 
 // Stable semantic identity used by the epoch cache. It covers function bytes

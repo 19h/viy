@@ -44,7 +44,7 @@ void viy_static_decode_func(const RaxApi *api, ViyArch arch, bool big_endian,
                             const ViyConfig &cfg, RefStats &stats)
 {
   if ( api == nullptr || api->decode == nullptr )
-    return; // older librax without the static decoder — nothing to do
+    return; // linked table without the decoder capability — nothing to do
 
   const DecoderArchitecture da =
       viy_decoder_architecture(arch, big_endian);

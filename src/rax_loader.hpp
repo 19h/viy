@@ -1,27 +1,22 @@
 /*
- * rax_loader.hpp — graceful runtime loader for librax (the RAX emulation engine).
+ * rax_loader.hpp — internal address table for the linked RAX emulation engine.
  *
- * viy compiles against rax.h ONLY for the C typedefs and the RAX_API_MAJOR/MINOR
- * constants; it links NOTHING against librax. Every rax_* function is referenced
- * through `decltype` in an unevaluated context, so no rax_* symbol is ever
- * odr-used and the plugin has no load-time dependency on librax. All calls go
- * through the function-pointer table resolved here at runtime via dlopen/dlsym.
+ * rax-capi is compiled into viy as a Rust staticlib.  Consumers retain one
+ * function-pointer boundary, but the table is populated from direct rax_*
+ * addresses instead of deployment-time symbol lookup.  This makes a missing
+ * or incomplete C ABI a link error and leaves no companion shared library.
  *
- * A missing, unloadable, ABI-incompatible, or symbol-incomplete library yields a
- * clean "unavailable" result (rax_load() == nullptr) — never a hard link
- * dependency, never a crash, never an exception. IDA can always load the
- * plugin; when librax is absent, viy reports the capability loss and continues
- * with independent providers.
- *
+ * VIY_RAX_DISABLE=1 intentionally returns an unavailable result so the
+ * independent IDA-native and deobfuscation providers remain isolatable.
  */
 #pragma once
 
-#include <rax.h> // rax_* declarations (typedefs + constants only — NO link dependency)
+#include <rax.h> // linked rax_* declarations, typedefs, and ABI constants
 
 namespace viy {
 
 // The subset of the rax C ABI that viy drives. Listed once as (field, symbol)
-// pairs so the struct fields and the dlsym names can never drift.
+// pairs so the struct fields and linked addresses cannot drift.
 #define VIY_RAX_FUNCS(X)                                     \
   /* version + diagnostics (used for the ABI gate) */        \
   X(version,                  rax_version)                   \
@@ -53,10 +48,9 @@ namespace viy {
   X(context_save,             rax_context_save)              \
   X(context_restore,          rax_context_restore)
 
-// Optional capabilities.  These are deliberately kept out of the mandatory
-// surface above: an older, ABI-compatible librax must remain usable for the
-// core discovery pass.  New analyses probe the corresponding field before use
-// and degrade independently when a capability is absent.
+// Capability additions remain separate so consumers and injected test tables
+// can degrade independently.  The production linked table populates all of
+// them from the rax 1.3 static ABI.
 #define VIY_RAX_OPTIONAL_FUNCS(X)                            \
   /* lifecycle/introspection */                              \
   X(engine_reset,             rax_engine_reset)              \
@@ -86,7 +80,7 @@ namespace viy {
   X(hook_add_mmio_read,      rax_hook_add_mmio_read)         \
   X(hook_add_mmio_write,     rax_hook_add_mmio_write)
 
-// Resolved rax_* entry points. Every field is valid iff rax_load() != nullptr.
+// Linked rax_* entry points. Every field is valid iff rax_load() != nullptr.
 struct RaxApi
 {
 #define X(field, sym) decltype(&sym) field = nullptr;
@@ -94,35 +88,32 @@ struct RaxApi
   VIY_RAX_OPTIONAL_FUNCS(X)
 #undef X
 
-  // Optional (rax API >= 1.2): the static instruction decoder. May be null with
-  // an older librax that only provides the emulation surface — callers must
-  // check `decode != nullptr` (see rax_can_decode) and degrade gracefully.
+  // Introduced in rax API 1.2.  Consumers still probe the field so cloned test
+  // tables and future capability policies can disable it independently.
   decltype(&rax_decode) decode = nullptr;
 
-  // Optional (rax API >= 1.3): stateless SMIR instruction-effect analysis.
+  // Introduced in rax API 1.3: stateless SMIR instruction-effect analysis.
   // The result is entirely caller-owned fixed-layout data; no Rust pointer
-  // crosses this boundary. Older 1.x libraries remain fully usable.
+  // crosses this boundary.
   decltype(&rax_analyze) analyze = nullptr;
 };
 
-// Load librax exactly once for the process (thread-safe), caching the outcome.
-// Returns the resolved API on success, or nullptr when emulation is unavailable
-// (librax absent / unloadable / ABI-incompatible / missing a required symbol).
+// Bind the linked table exactly once for the process (thread-safe), caching the
+// outcome. Returns nullptr only for an ABI mismatch or VIY_RAX_DISABLE=1.
 // Safe to call from any thread; in practice invoked once on the main thread.
 const RaxApi *rax_load();
 
-// Convenience: true iff librax is loaded and ABI-compatible.
+// Convenience: true iff linked rax is enabled and ABI-compatible.
 inline bool rax_available() { return rax_load() != nullptr; }
 
-// True iff the loaded librax additionally exposes the static decoder (rax >= 1.2).
+// True iff the linked table exposes the static decoder.
 inline bool rax_can_decode()
 {
   const RaxApi *a = rax_load();
   return a != nullptr && a->decode != nullptr;
 }
 
-// True iff the loaded librax additionally exposes the versioned stateless
-// instruction-effect analyzer (rax >= 1.3).
+// True iff the linked table exposes the versioned stateless analyzer.
 inline bool rax_can_analyze()
 {
   const RaxApi *a = rax_load();

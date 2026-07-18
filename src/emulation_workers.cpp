@@ -62,16 +62,23 @@ bool EmulationCancellation::cancelled() const noexcept
       || state->generation.load(std::memory_order_acquire) != generation_;
 }
 
-size_t viy_resolve_worker_count(int configured, size_t hard_cap)
+size_t viy_resolve_worker_count_for_hardware(
+    int configured, unsigned reported_hardware_concurrency, size_t hard_cap)
 {
   if ( hard_cap == 0 )
     return 0;
   if ( configured > 0 )
     return std::min<size_t>(size_t(configured), hard_cap);
-  const unsigned reported = std::thread::hardware_concurrency();
-  const size_t automatic = reported > 1 ? size_t(reported - 1) : size_t(1);
-  constexpr size_t kAutomaticEngineCap = 4;
-  return std::min(std::min(automatic, kAutomaticEngineCap), hard_cap);
+  const size_t automatic = reported_hardware_concurrency > 1
+                         ? size_t(reported_hardware_concurrency - 1)
+                         : size_t(1);
+  return std::min(std::min(automatic, kViyAutomaticWorkerCap), hard_cap);
+}
+
+size_t viy_resolve_worker_count(int configured, size_t hard_cap)
+{
+  return viy_resolve_worker_count_for_hardware(
+      configured, std::thread::hardware_concurrency(), hard_cap);
 }
 
 uint64_t viy_emulation_job_fingerprint(

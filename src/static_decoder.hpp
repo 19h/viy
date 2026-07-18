@@ -10,7 +10,7 @@
  *
  * It only ever adds a reference through viy_try_add_cref, so every safety guard
  * (executable target, instruction head, add-only-if-missing) applies. Runs on
- * the main thread. A no-op when rax's decoder is unavailable (older librax) or
+ * the main thread. A no-op when rax's decoder capability is unavailable or
  * the architecture cannot be decoded unambiguously here.
  */
 #pragma once

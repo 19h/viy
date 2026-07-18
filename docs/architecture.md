@@ -168,18 +168,17 @@ later scan. In the integrated lifecycle, contradiction gating is limited to the
 current complete provider generation plus user assertions; stale history cannot
 block a new snapshot.
 
-## rax runtime loader
+## rax linked adapter
 
-`rax_loader.cpp` is IDA-free and uses `dlopen`/`dlsym`; the plugin has no
-link-time dependency on librax. Loading is process-once and thread-safe.
+`rax_loader.cpp` is IDA-free and populates the existing `RaxApi` function table
+from direct addresses in the statically linked Rust C ABI. Binding is
+process-once and thread-safe. A missing entry point is a native link failure;
+the runtime gate rejects an ABI version mismatch. `VIY_RAX_DISABLE=1` provides
+an explicit unavailable state for provider isolation.
 
-The required surface corresponds to rax 1.1 emulation: engine lifecycle,
-mapping/writes, scalar register access, bounded execution, hooks, last-exit
-metadata, and context snapshots. A missing required symbol rejects the library
-as a whole. The major version must match and the runtime minor version must be
-at least 1.
-
-Optional symbols are resolved without rejecting an otherwise usable library:
+The linked surface contains rax 1.3 engine lifecycle, mapping/writes, scalar
+register access, bounded execution, hooks, last-exit metadata, context
+snapshots, and the following independently probed capability fields:
 
 - decoder (`rax_decode`, API 1.2);
 
@@ -194,7 +193,8 @@ Optional symbols are resolved without rejecting an otherwise usable library:
 - block, interrupt, port-I/O, and MMIO hooks.
 
 Only a subset is consumed today. `rax_analyze` is integrated into the decoder
-audit; the lifecycle simply skips it when the optional symbol is absent.
+audit; consumers retain null checks so injected test tables can model a missing
+capability without changing the linked production ABI.
 
 ## Worker scheduler
 
@@ -542,6 +542,9 @@ the semantic job fingerprint and evidence model. Pool construction is never
 reported as successful dynamic capability: initialization resolves through
 `initializing` to `available`, `partial`, or `unavailable`. Register-value
 tracking and operand-address tracking remain separate tri-state capabilities.
+The same record exposes the worker policy, configured value, reported hardware
+concurrency, automatic cap, and final selected count after the function-count
+limit.
 
 `VIY_LOG_LEVEL=0..3` selects quiet, lifecycle, progress, or per-function trace
 output. Progress defaults to one record per 1000 ms and is clamped to a cadence

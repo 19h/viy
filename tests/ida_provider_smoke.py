@@ -1,4 +1,4 @@
-"""Assert that a selected no-rax provider ran and persisted real-IDB facts."""
+"""Assert that a selected rax-disabled provider persisted real-IDB facts."""
 
 import os
 import traceback

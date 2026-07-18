@@ -303,7 +303,13 @@ int main()
   CHECK(viy_resolve_worker_count(99, 7) == 7);
   CHECK(viy_resolve_worker_count(0, 0) == 0);
   CHECK(viy_resolve_worker_count(0, 64) >= 1);
-  CHECK(viy_resolve_worker_count(0, 64) <= 4);
+  CHECK(viy_resolve_worker_count(0, 64) <= kViyAutomaticWorkerCap);
+  CHECK(viy_resolve_worker_count_for_hardware(0, 16) == 4);
+  CHECK(viy_resolve_worker_count_for_hardware(0, 4) == 3);
+  CHECK(viy_resolve_worker_count_for_hardware(0, 1) == 1);
+  CHECK(viy_resolve_worker_count_for_hardware(0, 0) == 1);
+  CHECK(viy_resolve_worker_count_for_hardware(0, 16, 2) == 2);
+  CHECK(viy_resolve_worker_count_for_hardware(7, 1, 64) == 7);
   EmulationJob fingerprint_job = job(0x4000);
   fingerprint_job.function.byte_hash = 0x1234;
   fingerprint_job.function.chunks = {{0x4000, 0x4010}};

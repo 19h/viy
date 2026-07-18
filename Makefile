@@ -1,7 +1,7 @@
-# viy build helper — builds librax (from the vendored rax submodule) and the viy
-# plugin, staging both artifacts into ./build, and can deploy them into IDA.
+# viy build helper — builds the vendored rax C API into the viy plugin as a
+# static library and stages the single self-contained plugin in ./build.
 #
-#   make                 # build librax + viy into ./build
+#   make                 # build self-contained viy into ./build
 #   make install         # deploy into $PLUGIN_DIR (or the per-user IDA plugins dir)
 #   make install-app     # deploy into $IDABIN/plugins
 #   make clean
@@ -20,7 +20,6 @@ BUILD_DIR ?= build
 DEBUG     ?= 0
 CMAKE_FLAGS ?=
 RAX_DIR   := $(CURDIR)/vendor/rax
-RAX_TARGET_DIR := $(RAX_DIR)/target/release
 
 ifeq ($(DEBUG),1)
 BUILD_TYPE := Debug
@@ -31,10 +30,8 @@ endif
 # Platform artifact names.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-RAX_LIB := librax.dylib
 VIY_LIB := viy.dylib
 else
-RAX_LIB := librax.so
 VIY_LIB := viy.so
 endif
 
@@ -50,23 +47,16 @@ IDA_USER_DIR := $(firstword $(subst :, ,$(IDAUSR)))
 endif
 PLUGIN_DIR ?= $(IDA_USER_DIR)/plugins
 
-.PHONY: all build rax viy configure test test-ida install install-app submodules clean distclean help
+.PHONY: all build viy configure test test-ida install install-app submodules clean distclean help
 
 all: build
 
-## build: librax + viy, both staged into $(BUILD_DIR)
-build: rax viy
+## build: self-contained viy with statically linked rax
+build: viy
 
 ## submodules: ensure the vendored rax is present
 submodules:
 	@test -f "$(RAX_DIR)/capi/include/rax.h" || git submodule update --init --depth 1 vendor/rax
-
-## rax: build librax via cargo and stage it into $(BUILD_DIR)
-rax: submodules
-	cargo build -p rax-capi --release --manifest-path "$(RAX_DIR)/Cargo.toml"
-	@mkdir -p "$(BUILD_DIR)"
-	cp "$(RAX_TARGET_DIR)/$(RAX_LIB)" "$(BUILD_DIR)/$(RAX_LIB)"
-	@echo "staged $(BUILD_DIR)/$(RAX_LIB)"
 
 ## configure: run CMake for the plugin (needs $IDASDK)
 configure: submodules
@@ -87,15 +77,14 @@ test: build
 test-ida: build
 	BUILD_DIR="$(abspath $(BUILD_DIR))" tests/run_ida_evidence_persistence.sh
 
-# viy.dylib goes directly in plugins/ (IDA loads it); librax.dylib goes in a
-# plugins/viy/ subdir so IDA does NOT try to load it as a plugin. The loader
-# finds it there (companion_dir search).
+# viy.dylib/viy.so goes directly in plugins/ and contains rax.  Remove only the
+# obsolete companion filenames managed by older viy installs.
 define install_to
-	mkdir -p "$(1)/viy"
+	mkdir -p "$(1)"
 	cp "$(BUILD_DIR)/$(VIY_LIB)" "$(1)/$(VIY_LIB)"
-	cp "$(BUILD_DIR)/$(RAX_LIB)" "$(1)/viy/$(RAX_LIB)"
-	rm -f "$(1)/$(RAX_LIB)"   # remove any librax left in plugins/ by an older install
-	@echo "installed $(VIY_LIB) -> $(1) ; $(RAX_LIB) -> $(1)/viy"
+	rm -f "$(1)/librax.dylib" "$(1)/librax.so" "$(1)/rax.dll"
+	rm -f "$(1)/viy/librax.dylib" "$(1)/viy/librax.so" "$(1)/viy/rax.dll"
+	@echo "installed self-contained $(VIY_LIB) -> $(1)"
 endef
 
 ## install: deploy into the user IDA plugins dir (~/.idapro/plugins by default)
@@ -117,10 +106,9 @@ distclean: clean
 
 help:
 	@echo "viy build helper"
-	@echo "  make               build librax + viy into ./$(BUILD_DIR)"
-	@echo "  make rax           build + stage librax only"
+	@echo "  make               build self-contained viy into ./$(BUILD_DIR)"
 	@echo "  make viy           build + stage the plugin only"
-	@echo "  make install       deploy viy + librax into $(PLUGIN_DIR)"
+	@echo "  make install       deploy self-contained viy into $(PLUGIN_DIR)"
 	@echo "  make install-app   deploy into the IDA install dir (\$$IDABIN/plugins)"
 	@echo "  make test          run rax ABI and IDA-free viy tests"
 	@echo "  make test-ida      run the licensed real-IDAT recovery integration test"

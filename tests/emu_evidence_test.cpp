@@ -294,7 +294,7 @@ void test_real_summaries()
   if ( rax_load() == nullptr )
   {
     if ( std::getenv("VIY_REQUIRE_RAX_TESTS") != nullptr )
-      expect(false, std::string("librax required: ") + rax_unavailable_reason());
+      expect(false, std::string("linked rax required: ") + rax_unavailable_reason());
     else
       std::cout << "SKIP: real summary tests (" << rax_unavailable_reason() << ")\n";
     return;
@@ -567,7 +567,7 @@ void test_real_engine_policy()
   if ( api == nullptr )
   {
     if ( std::getenv("VIY_REQUIRE_RAX_TESTS") != nullptr )
-      expect(false, std::string("librax required: ") + rax_unavailable_reason());
+      expect(false, std::string("linked rax required: ") + rax_unavailable_reason());
     else
       std::cout << "SKIP: real engine policy tests (" << rax_unavailable_reason() << ")\n";
     return;

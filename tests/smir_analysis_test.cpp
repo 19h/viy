@@ -89,7 +89,7 @@ void require_real_rax(const RaxApi *api)
               << rax_unavailable_reason() << '\n';
     std::exit(2);
   }
-  std::cout << "SKIP: compatible librax with rax_analyze not available\n";
+  std::cout << "SKIP: compatible linked rax_analyze not available\n";
   std::exit(77);
 }
 

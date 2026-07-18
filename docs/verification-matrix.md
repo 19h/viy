@@ -54,7 +54,7 @@ configuration:
 
 | Variable | Harness default | Purpose |
 |---|---:|---|
-| `VIY_REQUIRE_RAX_TESTS` | unset | Makes real-engine portions fail instead of skip; CMake sets it to `1` when a release librax is present at configure time. |
+| `VIY_REQUIRE_RAX_TESTS` | unset | Makes real-engine portions fail instead of skip; CMake sets it to `1` for the three targets linked to embedded rax. |
 | `IDAT` | required | Text-mode IDA used by the licensed shell harnesses. |
 | `BUILD_DIR` | repository `build-dev` | Plugin artifact directory used by the licensed shell harnesses. |
 | `VIY_IDA_TEST_DIR` | `/tmp/viy-evidence-persistence` | Disposable isolated IDAUSR/database/log root. |
@@ -83,40 +83,36 @@ configuration:
 | `viy.deobf_analysis` | `tests/deobf_analysis_test.cpp`: `test_get_pc`, `test_gap`, `test_entry_predicates`, `test_wrapper`, `test_constants_and_push_ret`, `test_dispatch`, `test_contradiction_gate` | Bounded classifiers, important false-positive guards, width-aware constant transformations, incomplete dispatch/CFF candidates, and validating sink behavior for contradictions versus ambiguity/corroboration. |
 | `viy.runtime_enrich_core` | `tests/runtime_enrich_core_test.cpp` | Exact `(run_id, seed)` write/string grouping; divergent-overlap rejection; strict ASCII/UTF-8/UTF-16/UTF-32; Pascal8/16/32 target-endian length prefixes; surrogate/code-unit handling; caps/overflow/ambiguity/scopes/determinism; and same-run sequence-ordered write-before-execute/read-before-edge gates. |
 
-`viy.emu_evidence` skips its real-engine section if librax is not found unless
-`VIY_REQUIRE_RAX_TESTS` is set. `viy.smir_analysis` and `viy.decoder_core` exit
-with CTest skip code 77 without the required optional rax capability. CMake sets
-`VIY_RAX_PATH` and the required-engine guard for all three when a release
-librax exists at configure time. A green run without that release artifact
-therefore does not prove their real rax portions.
+`viy.emu_evidence`, `viy.smir_analysis`, and `viy.decoder_core` link the same
+rax static archive as the plugin. CMake sets `VIY_REQUIRE_RAX_TESTS=1` for all
+three, so their real-engine portions cannot silently skip in the default CTest
+run.
 
 With `VIY_IDA_INTEGRATION_TESTS=ON`, CTest additionally registers two serial
 licensed targets:
 
 | CTest name | Direct coverage |
 |---|---|
-| `viy.ida_evidence_persistence` | Multi-process A/B netnode commit/recovery/migration; disabled-sweep restore; actual dynamic-cache hit; absolute no-dref gate; separate native/deobf producer provenance with the companion librax physically absent; levels 0/1/2/3; ordered phases/subphases; exhaustive snapshot accounting; exact worker/run/cache taxonomy; early-manual autoanalysis guard; and frozen delayed terminal snapshots. |
+| `viy.ida_evidence_persistence` | Multi-process A/B netnode commit/recovery/migration; disabled-sweep restore; actual dynamic-cache hit; absolute no-dref gate; separate native/deobf producer provenance with embedded rax explicitly disabled; levels 0/1/2/3; ordered phases/subphases; exhaustive snapshot accounting; exact worker/run/cache taxonomy; early-manual autoanalysis guard; and frozen delayed terminal snapshots. |
 | `viy.ida_hexrays_bridge` | Real Hex-Rays initialization, native-evidence publication, warning callback/rendering, a live recent cfunc through plug-in teardown, structured lifecycle/subphase invariants, and clean `qexit`; successful skip only when a compatible licensed decompiler is unavailable. |
 
-## Audit execution on 2026-07-10
+## Static-link audit execution on 2026-07-18
 
 The following commands were run against the implementation documented here:
 
 | Check | Result |
 |---|---|
-| Release plugin build against IDA SDK 9.3 with `VIY_TEST_STRICT_WARNINGS=ON` | Passed; `build-dev/viy.dylib` linked. |
-| IDA-free CTest in `build-dev` | 14/14 passed. The generated CTest file set `VIY_REQUIRE_RAX_TESTS=1` and the release librax path for emulation, SMIR, and decoder-core targets, so their real rax portions did not silently skip. |
-| Complete CTest in `build-dev`, including licensed integration targets | 16/16 passed. Both real-IDAT workflows asserted the structured start and completion lifecycle records. |
-| Debug ASan/UBSan build with strict pure-test warnings in `build-sanitize` | 14/14 passed with `ASAN_OPTIONS=detect_leaks=0`. |
-| GCC 15 release-mode compile/run with `-O3 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Werror` | Passed for diagnostics, configuration, and emulation-worker tests. |
+| Release arm64 plugin build against IDA SDK 9.4 with `VIY_TEST_STRICT_WARNINGS=ON` | Passed; `build/viy.dylib` linked at 13,772,408 bytes. Cargo and its C build-script dependencies received `MACOSX_DEPLOYMENT_TARGET=10.15`. |
+| `otool -L`, `nm -gU`, and full `nm` artifact audit | No `librax` load command; no exported `_rax_*` symbol; `_rax_analyze`, `_rax_decode`, and `_rax_version` present as local text symbols. |
+| IDA-free CTest in `build` | 14/14 passed. CMake set `VIY_REQUIRE_RAX_TESTS=1` for the embedded-rax emulation, SMIR, and decoder-core targets, so their real rax portions did not silently skip. |
 | `cargo test -p rax-capi --manifest-path vendor/rax/Cargo.toml` | 53/53 passed, plus 0 doc tests. |
-| `BUILD_DIR=build-dev tests/run_ida_evidence_persistence.sh` | Passed multi-process real-IDAT restore/corruption/marker/legacy phases, actual dynamic-cache reuse, the `VIY_WANT_DREFS=0` gate, and separate native/deobf no-librax producer-provenance runs. |
-| `BUILD_DIR=build-dev tests/run_ida_hexrays_bridge.sh` | Passed with Hex-Rays 9.4: a real `[viy]` native-evidence warning rendered at 100% confidence, its cfunc remained live through `qexit`, and callback teardown completed cleanly. |
-| Markdown relative-link/config-variable/fence/whitespace sanity | See the documentation handoff; no missing runtime variable or local link remained. |
+| `BUILD_DIR=build tests/run_ida_evidence_persistence.sh` | Passed multi-process real-IDAT restore/corruption/marker/legacy phases, actual dynamic-cache reuse, the `VIY_WANT_DREFS=0` gate, separate native/deobf `VIY_RAX_DISABLE=1` producer-provenance runs, levels 0/1/2/3, ordered subphases, exhaustive counter identities, worker-selection policy accounting, trace/terminal taxonomy equality, pre-autoanalysis manual guard, and two delayed frozen terminal snapshots. Enabled runs reported `rax_version="0.1.0 (rax-capi ABI 1.3.0)"`. |
+| `BUILD_DIR=build tests/run_ida_hexrays_bridge.sh` | Passed with Hex-Rays 9.4.0.260717: a real `[viy]` native-evidence warning rendered at 100% confidence, its cfunc remained live through `qexit`, structured observability invariants held, and callback teardown completed cleanly. |
+| Immediate no-change rebuild | Passed in 0.46 seconds wall time; the always-run Cargo target completed its dependency check in 0.20 seconds without relinking the plugin. |
 
 The plugin build emitted two non-fatal toolchain/SDK warnings: the selected
 libc++ deployment platform is no longer supported, and the build targets
-macOS 11 while the supplied `libida.dylib` targets macOS 12. These are
+macOS 11 while the supplied `libida.dylib` targets macOS 15. These are
 environment compatibility warnings, not test failures, but a release build
 should align its deployment target with the installed IDA SDK.
 
@@ -124,9 +120,9 @@ should align its deployment target with the installed IDA SDK.
 
 | Requirement | Integrated implementation | Verification | Status and remaining limitation |
 |---|---|---|---|
-| Native analysis remains useful without librax | `viy.cpp` creates native/deobfuscation providers before calling `rax_load`; `begin_epoch` admits either provider without rax | `viy.ida_evidence_persistence` physically removes the companion library, supplies an unusable `VIY_RAX_PATH`, and checks persisted producer provenance in separate native-only and deobf-only real-IDAT runs | Automated in the opt-in licensed harness for the x86 fixture. Individual native regfinder/ARM rules and downstream mutations are not covered there. |
+| Native analysis remains useful with rax disabled | `viy.cpp` creates native/deobfuscation providers before calling `rax_load`; `begin_epoch` admits either provider without rax | `viy.ida_evidence_persistence` sets `VIY_RAX_DISABLE=1` and checks persisted producer provenance in separate native-only and deobf-only real-IDAT runs | Automated in the opt-in licensed harness for the x86 fixture. Individual native regfinder/ARM rules and downstream mutations are not covered there. |
 | Native scans are read-only during production | `NativeAnalysisProvider` emits through `NativeFactSink`; all mutations are downstream | Architectural separation; real native-only provider provenance | Integrated. The real fixture proves the provider emitted facts, but a full before/after IDB snapshot isolating scan-time writes is still needed. |
-| Deobfuscation scans are read-only and bounded | `DeobfAnalysisProvider` emits through a sink; finite instruction/block/classifier ceilings | `viy.deobf_analysis`; real no-rax deobf-only provider provenance | Core classifiers, contradiction gate, and one real x86 IDA-adapter path are automated. ARM adapter translation, downstream mutation, and a scan-time no-write snapshot remain untested. |
+| Deobfuscation scans are read-only and bounded | `DeobfAnalysisProvider` emits through a sink; finite instruction/block/classifier ceilings | `viy.deobf_analysis`; real rax-disabled deobf-only provider provenance | Core classifiers, contradiction gate, and one real x86 IDA-adapter path are automated. ARM adapter translation, downstream mutation, and a scan-time no-write snapshot remain untested. |
 | Complete function chunks are snapshotted and scanned | `FuncRange::chunks`; `viy_snapshot`; native, emulator membership, static decoder, decoder audit, and opaque pass iterate chunks | `viy.program_model`; plugin build | Pure lookup covers non-contiguous/shared tails, exact-entry priority, gaps, and overflow. Live IDA chunk extraction and each adapter's full-chunk traversal remain build-only. |
 | Function identity is rebase-stable and content-sensitive | `viy_function_byte_hash`, hash version 1, relative chunk topology, loaded-byte state | `viy.program_model` | Rebase invariance and byte, topology, mask, permission, bitness, architecture, and endian sensitivity are automated for production core code. Live snapshot generation carry-forward remains an IDA lifecycle concern. |
 | Bounded fixed-point convergence after IDB changes | `change_count`, `waiting_for_auto`, `begin_epoch`, `VIY_MAX_EPOCHS` | Implementation inspection; plugin build | Integrated, untested semantically. A real-IDAT fixture should cause a first-epoch function/code discovery and assert second-epoch pickup plus maximum-epoch termination. |
@@ -154,7 +150,7 @@ should align its deployment target with the installed IDA SDK.
 | Generic IDB consumer is contradiction-aware and confidence-gated | `evidence_apply_policy.*` decides; `evidence_apply.cpp` mutates | `viy.evidence_apply_policy` | All payloads, target kinds, exact confidence/run thresholds, configuration gates, contradiction suppression, and ambiguity/variation handling are automated in production policy code. Real-IDB cref/function/comment application remains untested. |
 | Dynamic events enter the neutral ledger | `evidence_bridge.cpp` | `test_evidence_bridge`; summary fixture also asserts call/CFG/memory values | Automated for image facts, endianness, final-write attribution, function outcomes, and synthetic-address exclusion. |
 | Persistence envelope is deterministic and detects corruption | `EvidenceStore::serialize/deserialize` | Evidence unit suite | Automated without IDA. |
-| Netnode persistence is staged, verified, and crash-recoverable | `IdaEvidenceAdapter` marker plus separate A/B slot nodes; lifecycle persists full history and derives active authority separately | `viy.ida_evidence_persistence`: `tests/run_ida_evidence_persistence.sh` and `tests/ida_evidence_persistence.py` | Opt-in licensed CTest covers active-slot corruption, retained-slot fallback, invalid-marker merge, legacy-layout migration, disabled-sweep restore, real cache reuse, the absolute no-dref gate, and no-rax provider provenance. |
+| Netnode persistence is staged, verified, and crash-recoverable | `IdaEvidenceAdapter` marker plus separate A/B slot nodes; lifecycle persists full history and derives active authority separately | `viy.ida_evidence_persistence`: `tests/run_ida_evidence_persistence.sh` and `tests/ida_evidence_persistence.py` | Opt-in licensed CTest covers active-slot corruption, retained-slot fallback, invalid-marker merge, legacy-layout migration, disabled-sweep restore, real cache reuse, the absolute no-dref gate, and rax-disabled provider provenance. |
 | Restore works while sweep is disabled | Constructor restores before `VIY_ENABLED` gate | Real-IDAT harness uses `VIY_ENABLED=0` during recovery modes | Covered when the opt-in harness is run. |
 
 ## Dynamic exploration and ABI requirements
@@ -212,8 +208,8 @@ should align its deployment target with the installed IDA SDK.
 
 | Expansion | Repository evidence | Runtime status | Work required before claiming support |
 |---|---|---|---|
-| rax 1.3 stateless SMIR effects | Vendored `rax_analyze` ABI and Rust tests; `src/smir_analysis.*` validates caller-owned sizing/ABI records and maps proved direct targets, resolved absolute/PC-relative accesses, and constant registers | Integrated in the per-head decoder-audit walk and a real-librax CTest target | Add AArch64/RISC-V/Hexagon viy-consumer fixtures and decide whether/how neutral memory/register effects should become IDA operand annotations. |
-| Bounded deobfuscation analysis | `src/deobf_analysis_core.*`, IDA adapter/store, and `tests/deobf_analysis_test.cpp` cover get-PC, jump gaps, entry predicates, wrappers, constant chains, push/return, dispatch candidates, and contradiction gating | Integrated as default-on `VIY_DEOBF`; pure CTest plus a real x86 deobf-only/no-librax provider-provenance run | Add broader x86 and ARM IDB fixtures for downstream crefs/comments, false-positive resistance, and read-only scan snapshots. Incomplete dispatch maps intentionally remain non-mutating evidence. |
+| rax 1.3 stateless SMIR effects | Vendored `rax_analyze` ABI and Rust tests; `src/smir_analysis.*` validates caller-owned sizing/ABI records and maps proved direct targets, resolved absolute/PC-relative accesses, and constant registers | Integrated in the per-head decoder-audit walk and an embedded-rax CTest target | Add AArch64/RISC-V/Hexagon viy-consumer fixtures and decide whether/how neutral memory/register effects should become IDA operand annotations. |
+| Bounded deobfuscation analysis | `src/deobf_analysis_core.*`, IDA adapter/store, and `tests/deobf_analysis_test.cpp` cover get-PC, jump gaps, entry predicates, wrappers, constant chains, push/return, dispatch candidates, and contradiction gating | Integrated as default-on `VIY_DEOBF`; pure CTest plus a real x86 deobf-only/rax-disabled provider-provenance run | Add broader x86 and ARM IDB fixtures for downstream crefs/comments, false-positive resistance, and read-only scan snapshots. Incomplete dispatch maps intentionally remain non-mutating evidence. |
 
 ## Safety policy summary
 

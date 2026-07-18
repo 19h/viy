@@ -7,8 +7,8 @@
  * then snapshots the program and submits immutable function jobs to independent
  * off-thread rax engines. The UI timer drains results in deterministic function
  * order; every IDA query and database mutation remains on the main thread. If
- * librax is absent or a backend cannot be driven, native/static providers still
- * run. Bounded, non-modal lifecycle/progress diagnostics are emitted from the
+ * embedded rax is disabled or a backend cannot be driven, native/static
+ * providers still run. Bounded, non-modal lifecycle/progress diagnostics are emitted from the
  * main thread to IDA's Output window and headless log.
  */
 #include <algorithm>
@@ -17,6 +17,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -863,8 +864,8 @@ void viy_t::on_analysis_done()
     return;
   }
 
-  // Native providers remain useful without librax. Each rax-backed provider is
-  // capability-gated independently in begin_epoch().
+  // Native providers remain useful with embedded rax disabled. Each rax-backed
+  // provider is capability-gated independently in begin_epoch().
   api = rax_load();
 
   started = true;
@@ -1004,6 +1005,8 @@ bool viy_t::begin_epoch()
           + " duration_ms=" + std::to_string(
                 snapshot_finished_ms - snapshot_started_ms));
   const bool can_attempt_dynamic = api != nullptr && !img.entries.empty();
+  const unsigned hardware_threads = std::thread::hardware_concurrency();
+  size_t selected_worker_count = 0;
   if ( can_attempt_dynamic )
   {
     // Entry-state/type/import-summary changes can alter semantics even when no
@@ -1021,8 +1024,10 @@ bool viy_t::begin_epoch()
     options.windows_x64 = windows_x64;
     options.call_summaries = call_summaries;
 
-    size_t worker_count = viy_resolve_worker_count(cfg.workers);
+    size_t worker_count = viy_resolve_worker_count_for_hardware(
+        cfg.workers, hardware_threads);
     worker_count = std::min(worker_count, std::max<size_t>(img.entries.size(), 1));
+    selected_worker_count = worker_count;
     const size_t queue_capacity = worker_count * 2; // cfg.workers is capped at 64
     worker_pool.reset(new EmulationWorkerPool(
         worker_count, viy_make_rax_worker_factory(std::move(options)),
@@ -1059,6 +1064,15 @@ bool viy_t::begin_epoch()
   capabilities += enabled_word(cfg.persist_evidence);
   capabilities += " workers_requested="
       + std::to_string(initial_workers.requested_workers);
+  capabilities += " workers_policy=";
+  capabilities += cfg.workers == 0 ? "auto" : "explicit";
+  capabilities += " workers_configured=" + std::to_string(cfg.workers);
+  capabilities += " workers_hardware_threads="
+      + std::to_string(hardware_threads);
+  capabilities += " workers_auto_cap="
+      + std::to_string(kViyAutomaticWorkerCap);
+  capabilities += " workers_selected="
+      + std::to_string(selected_worker_count);
   capabilities += " workers_initialized="
       + std::to_string(initial_workers.initialized_workers);
   capabilities += " workers_available="

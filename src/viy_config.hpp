@@ -35,7 +35,7 @@ struct ViyConfig
   bool     make_code     = true;    // auto_make_code/plan_ea on discovered code targets
   bool     want_drefs    = true;    // record data references (needs a recording backend)
   bool     want_static   = true;    // run the rax static-decode cross-check pass (rax >= 1.2)
-  bool     want_native   = true;    // IDA-native analysis providers (works without librax)
+  bool     want_native   = true;    // IDA-native providers (work with rax disabled)
   bool     want_deobf    = true;    // additional read-only structural/deobfuscation evidence
   bool     persist_evidence = true; // versioned per-IDB evidence/provenance ledger
   bool     strict_perms  = true;    // honor IDA segment permissions in the guest image

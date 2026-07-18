@@ -3,17 +3,16 @@
 # cross-references the main analysis missed (indirect calls/jumps, jump-table
 # targets, computed data accesses).
 #
-# rax is pulled in HEADER-ONLY (rax.h, for typedefs/constants). librax is NOT
-# linked; it is dlopen'd at runtime by src/rax_loader.cpp. This keeps the plugin
-# always-loadable: when librax is absent, IDA-native and deobfuscation evidence
-# providers remain available.
+# rax-capi is built as a Rust staticlib and linked into the plugin.  The final
+# viy artifact therefore contains the emulator and has no deployment-time
+# dependency on librax.dylib/librax.so/rax.dll.
 #
 # Build:
 #   export IDASDK=/path/to/ida-sdk           # required
 #   export IDABIN=/path/to/ida               # optional (plugin install dir)
 #   cmake -S . -B build \
 #     -DIDA_CMAKE_DIR=/path/to/ida-cmake \
-#     -DRAX_CAPI_DIR=/path/to/rax/capi        # contains include/rax.h
+#     -DRAX_CAPI_DIR=/path/to/rax/capi        # contains Cargo.toml + include/rax.h
 #   cmake --build build
 # ============================================================================
 cmake_minimum_required(VERSION 3.27)
@@ -54,17 +53,91 @@ function(viy_harden_test_target target)
   endif()
 endfunction()
 
-# --- rax C API: header only (dlopen'd at runtime, never linked) ---------------
-# Defaults to the vendored submodule (vendor/rax). librax itself is built
-# separately (see the Makefile / `cargo build -p rax-capi`); viy only needs the
-# header here.
-set(RAX_CAPI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/capi" CACHE PATH "rax capi dir (contains include/rax.h)")
+# --- rax C API: Rust staticlib ------------------------------------------------
+# Drive Cargo from an always-run target: Cargo's own dependency graph makes an
+# unchanged invocation cheap, while every Rust/build-script change is observed
+# without trying to mirror Cargo inputs in CMake.
+set(RAX_CAPI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/capi" CACHE PATH
+    "rax capi source dir (contains Cargo.toml, CMakeLists.txt, and include/rax.h)")
 if(NOT EXISTS "${RAX_CAPI_DIR}/include/rax.h")
   message(FATAL_ERROR
     "rax.h not found under '${RAX_CAPI_DIR}/include'. "
     "Did you clone submodules? (git submodule update --init) "
     "or set -DRAX_CAPI_DIR=/path/to/rax/capi.")
 endif()
+if(NOT EXISTS "${RAX_CAPI_DIR}/Cargo.toml")
+  message(FATAL_ERROR
+    "Static rax integration requires Cargo.toml under '${RAX_CAPI_DIR}'.")
+endif()
+
+set(RAX_CARGO_PROFILE "release" CACHE STRING "Cargo profile used for embedded rax")
+set(RAX_FEATURES "" CACHE STRING
+    "Optional embedded rax Cargo features (semicolon-separated)")
+find_program(VIY_CARGO_EXECUTABLE cargo REQUIRED)
+
+if(RAX_CARGO_PROFILE STREQUAL "release")
+  set(_rax_profile_dir "release")
+  set(_rax_profile_args --release)
+elseif(RAX_CARGO_PROFILE STREQUAL "dev"
+       OR RAX_CARGO_PROFILE STREQUAL "debug")
+  set(_rax_profile_dir "debug")
+  set(_rax_profile_args "")
+else()
+  set(_rax_profile_dir "${RAX_CARGO_PROFILE}")
+  set(_rax_profile_args --profile "${RAX_CARGO_PROFILE}")
+endif()
+
+set(_rax_feature_args "")
+if(RAX_FEATURES)
+  string(REPLACE ";" "," _rax_feature_csv "${RAX_FEATURES}")
+  set(_rax_feature_args --features "${_rax_feature_csv}")
+endif()
+
+set(_rax_target_dir "${CMAKE_CURRENT_BINARY_DIR}/rax-capi/cargo")
+set(_rax_static_path
+    "${_rax_target_dir}/${_rax_profile_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}rax${CMAKE_STATIC_LIBRARY_SUFFIX}")
+set(_rax_cargo_environment "CARGO_TARGET_DIR=${_rax_target_dir}")
+if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET)
+  # Cargo build scripts (notably cc-rs dependencies) otherwise compile for the
+  # host macOS version, which can make the plugin unloadable on IDA's target.
+  list(APPEND _rax_cargo_environment
+       "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+endif()
+
+add_custom_target(viy_rax_cargo
+  COMMAND ${CMAKE_COMMAND} -E env ${_rax_cargo_environment}
+          ${VIY_CARGO_EXECUTABLE} build --package rax-capi
+          --manifest-path "${RAX_CAPI_DIR}/Cargo.toml"
+          ${_rax_profile_args} ${_rax_feature_args}
+  BYPRODUCTS "${_rax_static_path}"
+  WORKING_DIRECTORY "${RAX_CAPI_DIR}"
+  COMMENT "Building embedded rax staticlib via Cargo (${RAX_CARGO_PROFILE})"
+  VERBATIM)
+
+set(_rax_static_syslibs "")
+if(APPLE)
+  find_library(_rax_corefoundation CoreFoundation REQUIRED)
+  find_library(_rax_security Security REQUIRED)
+  find_library(_rax_systemconfiguration SystemConfiguration REQUIRED)
+  find_library(_rax_iconv iconv REQUIRED)
+  find_library(_rax_objc objc REQUIRED)
+  set(_rax_static_syslibs
+      "${_rax_corefoundation}" "${_rax_security}"
+      "${_rax_systemconfiguration}" "${_rax_iconv}" "${_rax_objc}"
+      Threads::Threads)
+elseif(WIN32)
+  set(_rax_static_syslibs ws2_32 userenv ntdll bcrypt)
+else()
+  set(_rax_static_syslibs Threads::Threads ${CMAKE_DL_LIBS} m rt util)
+endif()
+
+add_library(rax_static STATIC IMPORTED GLOBAL)
+set_target_properties(rax_static PROPERTIES
+  IMPORTED_LOCATION "${_rax_static_path}"
+  INTERFACE_INCLUDE_DIRECTORIES "${RAX_CAPI_DIR}/include"
+  INTERFACE_LINK_LIBRARIES "${_rax_static_syslibs}")
+add_dependencies(rax_static viy_rax_cargo)
+add_library(rax::rax_static ALIAS rax_static)
 
 # --- The plugin ---------------------------------------------------------------
 # ida_add_plugin: positional NAME, links idasdk::plugin
@@ -110,8 +183,17 @@ ida_add_plugin(viy
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
-# dlopen/dlsym for the runtime librax loader (empty on macOS, -ldl on Linux).
-target_link_libraries(viy PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+# rax::rax_static carries the platform native libraries emitted by rustc.
+target_link_libraries(viy PRIVATE rax::rax_static Threads::Threads)
+
+# Do not re-export the embedded C ABI from the plugin.  Consumers reach it only
+# through viy's internal RaxApi table.
+if(APPLE)
+  target_link_options(viy PRIVATE
+    "LINKER:-load_hidden,$<TARGET_FILE:rax_static>")
+elseif(UNIX)
+  target_link_options(viy PRIVATE "LINKER:--exclude-libs,librax.a")
+endif()
 
 if(BUILD_TESTING)
   add_executable(viy_evidence_tests
@@ -181,7 +263,7 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${RAX_CAPI_DIR}/include")
   target_compile_features(viy_emu_evidence_tests PRIVATE cxx_std_17)
-  target_link_libraries(viy_emu_evidence_tests PRIVATE ${CMAKE_DL_LIBS})
+  target_link_libraries(viy_emu_evidence_tests PRIVATE rax::rax_static)
   viy_harden_test_target(viy_emu_evidence_tests)
 
   add_executable(viy_abi_policy_tests
@@ -224,7 +306,7 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${RAX_CAPI_DIR}/include")
   target_compile_features(viy_smir_analysis_tests PRIVATE cxx_std_17)
-  target_link_libraries(viy_smir_analysis_tests PRIVATE ${CMAKE_DL_LIBS})
+  target_link_libraries(viy_smir_analysis_tests PRIVATE rax::rax_static)
   viy_harden_test_target(viy_smir_analysis_tests)
 
   add_executable(viy_decoder_core_tests
@@ -235,7 +317,7 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${RAX_CAPI_DIR}/include")
   target_compile_features(viy_decoder_core_tests PRIVATE cxx_std_17)
-  target_link_libraries(viy_decoder_core_tests PRIVATE ${CMAKE_DL_LIBS})
+  target_link_libraries(viy_decoder_core_tests PRIVATE rax::rax_static)
   viy_harden_test_target(viy_decoder_core_tests)
 
   add_executable(viy_deobf_analysis_tests
@@ -330,31 +412,9 @@ if(BUILD_TESTING)
   add_test(NAME viy.decoder_core COMMAND viy_decoder_core_tests)
   add_test(NAME viy.deobf_analysis COMMAND viy_deobf_analysis_tests)
   add_test(NAME viy.runtime_enrich_core COMMAND viy_runtime_enrich_core_tests)
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.dylib")
-    set_tests_properties(viy.emu_evidence PROPERTIES ENVIRONMENT
-      "VIY_RAX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.dylib;VIY_REQUIRE_RAX_TESTS=1")
-  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.so")
-    set_tests_properties(viy.emu_evidence PROPERTIES ENVIRONMENT
-      "VIY_RAX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.so;VIY_REQUIRE_RAX_TESTS=1")
-  endif()
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.dylib")
-    set_tests_properties(viy.smir_analysis PROPERTIES ENVIRONMENT
-      "VIY_RAX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.dylib;VIY_REQUIRE_RAX_TESTS=1")
-  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.so")
-    set_tests_properties(viy.smir_analysis PROPERTIES ENVIRONMENT
-      "VIY_RAX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.so;VIY_REQUIRE_RAX_TESTS=1")
-  else()
-    set_tests_properties(viy.smir_analysis PROPERTIES SKIP_RETURN_CODE 77)
-  endif()
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.dylib")
-    set_tests_properties(viy.decoder_core PROPERTIES ENVIRONMENT
-      "VIY_RAX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.dylib;VIY_REQUIRE_RAX_TESTS=1")
-  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.so")
-    set_tests_properties(viy.decoder_core PROPERTIES ENVIRONMENT
-      "VIY_RAX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/vendor/rax/target/release/librax.so;VIY_REQUIRE_RAX_TESTS=1")
-  else()
-    set_tests_properties(viy.decoder_core PROPERTIES SKIP_RETURN_CODE 77)
-  endif()
+  set_tests_properties(
+    viy.emu_evidence viy.smir_analysis viy.decoder_core
+    PROPERTIES ENVIRONMENT "VIY_REQUIRE_RAX_TESTS=1")
   if(VIY_IDA_INTEGRATION_TESTS)
     if(NOT VIY_IDAT)
       message(FATAL_ERROR
@@ -380,11 +440,13 @@ if(BUILD_TESTING)
   endif()
 endif()
 
-# Emit the plugin into the build tree (the Makefile stages librax next to it).
+# Emit the self-contained plugin into the build tree.
 # This overrides ida_add_plugin's default of installing straight into
 # IDA_PLUGIN_DIR; use `make install` (or the install target) to deploy.
 set_target_properties(viy PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-message(STATUS "viy: IDASDK=$ENV{IDASDK}  ida-cmake=${IDA_CMAKE_DIR}  rax=${RAX_CAPI_DIR}/include (header-only)")
+message(STATUS
+  "viy: IDASDK=$ENV{IDASDK}  ida-cmake=${IDA_CMAKE_DIR}  "
+  "rax=${RAX_CAPI_DIR} (static, cargo-profile=${RAX_CARGO_PROFILE})")

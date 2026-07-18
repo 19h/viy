@@ -1,19 +1,19 @@
 # viy
 
-viy is a per-database IDA plugin that combines IDA-native analysis with
-optional [rax](https://github.com/hexrayssa/rax) decoding and emulation. Its goal
+viy is a per-database IDA plugin that combines IDA-native analysis with an
+embedded [rax](https://github.com/hexrayssa/rax) decoder and emulator. Its goal
 is to recover useful analysis evidence that the initial disassembly missed while
 keeping speculative results distinguishable from proofs.
 
 The current plugin has five integrated analysis paths:
 
 - An IDA-native, read-only provider resolves selected indirect targets and
-  proves a small set of branch/structural facts. It works when librax is absent.
+  proves a small set of branch/structural facts. It works when rax is disabled.
 
 - A second read-only deobfuscation provider recognizes bounded get-PC and
   push/return gadgets, local constant chains, entry predicates, wrappers,
   suspicious skipped regions, and dispatcher/CFF candidates. It also works
-  without librax.
+  when rax is disabled.
 
 - Independent off-thread rax engines explore functions under deterministic and
   call-site-derived entry states. They record executed transfers, memory
@@ -33,21 +33,19 @@ detection, and crash-recoverable per-IDB persistence. See
 
 ## Capability levels
 
-viy never links against librax. It resolves the C ABI at runtime, gates the
-required 1.1 emulation surface as a unit, and probes newer capabilities
-independently.
+viy builds `rax-capi` as a Rust `staticlib` and links it into the plugin. The
+vendored ABI is gated once at process initialization; consumers continue to
+probe decoder and analyzer fields independently.
 
-| Runtime | Available behavior |
+| Embedded capability | Available behavior |
 |---|---|
-| No compatible librax | IDA-native and deobfuscation evidence production plus guarded evidence consumption on x86 and ARM; evidence restore/persist; optional Hex-Rays presentation. |
-| rax 1.1+ | Dynamic exploration when that architecture/backend reports stepping support and a clean context snapshot can be captured. Memory-derived features additionally depend on working memory hooks and, for exact final bytes, `rax_mem_read`. |
-| rax 1.2+ | Static direct-target recovery and the IDA/rax decoder audit through optional `rax_decode`. |
-| rax 1.3+ | The decoder audit additionally calls optional `rax_analyze` at existing code heads and records statically resolved SMIR effects. Rich effects are currently defined by the vendored ABI for x86-64, AArch64, RISC-V 64, and Hexagon; other valid decode modes report unsupported/partial effects. |
+| `VIY_RAX_DISABLE=1` | IDA-native and deobfuscation evidence production plus guarded evidence consumption on x86 and ARM; evidence restore/persist; optional Hex-Rays presentation. |
+| rax 1.3 linked and enabled | Dynamic exploration when the selected architecture/backend reports stepping support; static direct-target recovery; decoder audit; and stateless SMIR effects. Memory-derived features additionally depend on working memory hooks and, for exact final bytes, `rax_mem_read`. Rich SMIR effects are currently defined by the vendored ABI for x86-64, AArch64, RISC-V 64, and Hexagon; other valid decode modes report unsupported/partial effects. |
 
-If librax fails the ABI/symbol gate, only rax-backed paths are unavailable. The
-native provider is not disabled with them. viy reports the capability decision,
-analysis phases, bounded progress, evidence policy results, and completion in
-IDA's Output window and headless log.
+An ABI mismatch or `VIY_RAX_DISABLE=1` disables only rax-backed paths. The
+native provider is independent. viy reports the capability decision, analysis
+phases, bounded progress, evidence policy results, and completion in IDA's
+Output window and headless log.
 
 ## Lifecycle and data flow
 
@@ -339,14 +337,15 @@ Architecture detection and each provider are independently gated.
 | Cortex-M | Only a dedicated processor ID/name | No / no | Thumb | Yes, if backend supports stepping | AAPCS integer registers |
 | Hexagon/QDSP6 | Dedicated ID or stable processor name | No / no | Yes | Yes, if backend supports stepping | R0–R5 integer registers |
 
-“Requested” does not promise that every librax build implements every backend;
+“Requested” does not promise that every embedded rax build implements every backend;
 viy asks `rax_engine_supports_stepping` and disables dynamic discovery for an
 engine that cannot be driven.
 
 ## Building
 
-rax is a git submodule under `vendor/rax`. The Makefile builds the vendored C
-API library and the plugin, staging both in `BUILD_DIR` (default `build`):
+rax is a git submodule under `vendor/rax`. The Makefile builds its C API as a
+Rust static library, links it into viy, and stages one plugin artifact in
+`BUILD_DIR` (default `build`):
 
 ```sh
 git submodule update --init --depth 1 vendor/rax
@@ -356,11 +355,10 @@ make
 ```
 
 Useful build variables are `BUILD_DIR`, `DEBUG=1`, `CMAKE_FLAGS`, and
-`IDA_CMAKE_DIR`. `make rax`, `make viy`, `make test`, `make test-ida`,
+`IDA_CMAKE_DIR`. `make viy`, `make test`, `make test-ida`,
 `make clean`, `make distclean`, and `make help` are also available. `make test`
 runs the rax C-ABI suite and IDA-free CTest targets; `make test-ida` runs the
-licensed persistence/recovery harness. The plugin includes `rax.h` for
-declarations but does not link librax.
+licensed persistence/recovery harness.
 
 | Make/CMake setting | Default | Purpose |
 |---|---|---|
@@ -369,7 +367,9 @@ declarations but does not link librax.
 | `BUILD_DIR` | `build` | Makefile CMake/staging directory. |
 | `DEBUG` | `0` | `0` selects Release; `1` selects Debug. |
 | `CMAKE_FLAGS` | empty | Additional arguments passed by the Makefile configure step. |
-| `RAX_CAPI_DIR` | `vendor/rax/capi` | CMake path containing `include/rax.h`. |
+| `RAX_CAPI_DIR` | `vendor/rax/capi` | rax-capi source path containing `Cargo.toml`, `CMakeLists.txt`, and `include/rax.h`. |
+| `RAX_CARGO_PROFILE` | `release` | Cargo profile for the embedded Rust static library. |
+| `RAX_FEATURES` | empty | Semicolon-separated optional rax features forwarded to Cargo. |
 | `BUILD_TESTING` | CTest default (`ON`) | Build/register IDA-free tests. |
 | `VIY_TEST_STRICT_WARNINGS` | `ON` | Compile pure tests with strict warnings as errors on Clang/GCC. |
 | `VIY_TEST_SANITIZERS` | `OFF` | Add ASan/UBSan to pure tests on Clang/GCC. |
@@ -407,26 +407,14 @@ make install-app IDABIN=/path/to/ida
 
 `make install` honors the first path in `IDAUSR`, otherwise installs to
 `~/.idapro/plugins`; `PLUGIN_DIR` overrides it. `install-app` installs under
-`$IDABIN/plugins`.
-
-The layout intentionally keeps librax out of IDA's plugin scan:
+`$IDABIN/plugins`. Both install one runtime artifact:
 
 ```text
-plugins/viy.dylib          # or viy.so
-plugins/viy/librax.dylib   # or librax.so
+plugins/viy.dylib          # or viy.so / viy.dll
 ```
 
-librax search order is:
-
-1. `VIY_RAX_PATH`;
-
-2. the platform loader search path (`librax.dylib`, `librax.so`, or `rax.dll`);
-
-3. the `viy/` companion directory next to the plugin;
-
-4. next to the plugin binary; then
-
-5. next to the IDA executable.
+The install recipes remove obsolete companion `librax` files left by earlier
+viy installations.
 
 ## Runtime observability
 
@@ -448,6 +436,9 @@ frozen, so later manual status requests do not include post-analysis idle time.
 Dynamic capability uses `off`, `initializing`, `available`, `partial`, or
 `unavailable`; native register-value and operand-address trackers are reported
 independently as `unknown`, `available`, or `unavailable` where applicable.
+Capability records expose the worker policy, configured value, reported
+hardware concurrency, automatic cap, and final selected count, including any
+function-count limit.
 
 `VIY_LOG_LEVEL` selects the surface:
 
@@ -493,7 +484,7 @@ documented clamps are applied.
 | `VIY_STRICT_PERMS` | `1` | Apply IDA segment permissions and viy's hook checks instead of treating the guest image as RWX; see the backend caveat below. |
 | `VIY_IMPORT_SUMMARIES` | `1` | Model the selected named library/import calls. |
 | `VIY_PERSIST_EVIDENCE` | `1` | Restore and persist the versioned per-IDB evidence ledger. |
-| `VIY_RAX_PATH` | unset | Explicit librax path; also used first in runtime discovery. |
+| `VIY_RAX_DISABLE` | unset | Exact value `1` disables the embedded rax table; used for provider isolation and operational diagnosis. |
 
 ### References and enrichment
 

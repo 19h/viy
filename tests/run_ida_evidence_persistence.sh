@@ -4,17 +4,14 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 : "${IDAT:?set IDAT to the IDA text-mode executable}"
 BUILD_DIR=${BUILD_DIR:-$ROOT/build-dev}
-RAX_LIB=${VIY_RAX_PATH:-$ROOT/vendor/rax/target/release/librax.dylib}
 WORK=${VIY_IDA_TEST_DIR:-/tmp/viy-evidence-persistence}
 
 test -x "$IDAT"
 test -f "$BUILD_DIR/viy.dylib"
-test -f "$RAX_LIB"
 
 rm -rf "$WORK"
-mkdir -p "$WORK/user/plugins/viy" "$WORK/out"
+mkdir -p "$WORK/user/plugins" "$WORK/out"
 cp "$BUILD_DIR/viy.dylib" "$WORK/user/plugins/viy.dylib"
-cp "$RAX_LIB" "$WORK/user/plugins/viy/$(basename "$RAX_LIB")"
 
 # An isolated IDAUSR keeps the test hermetic. Reuse only the local license,
 # never repository state or the user's installed viy plugin.
@@ -42,7 +39,7 @@ OBSERVABILITY_SCRIPT=$ROOT/tests/ida_observability_smoke.py
 OBSERVABILITY_VERIFY=$ROOT/tests/verify_observability_log.py
 DB=$WORK/out/evidence.i64
 STATE=$WORK/out/state.json
-COMMON="IDAUSR=$WORK/user VIY_RAX_PATH=$RAX_LIB VIY_WORKERS=2 VIY_EXPLORE_RUNS=2 VIY_MAX_EPOCHS=1 VIY_HEXRAYS_BRIDGE=0 VIY_LOG_LEVEL=2 VIY_PROGRESS_INTERVAL_MS=100"
+COMMON="IDAUSR=$WORK/user VIY_WORKERS=2 VIY_EXPLORE_RUNS=2 VIY_MAX_EPOCHS=1 VIY_HEXRAYS_BRIDGE=0 VIY_LOG_LEVEL=2 VIY_PROGRESS_INTERVAL_MS=100"
 
 run_ida() {
   mode=$1
@@ -102,6 +99,7 @@ python3 "$OBSERVABILITY_VERIFY" cache "$CACHE_LOG"
 # plug-in entry twice after completion and proves terminal elapsed time is frozen.
 SUMMARY_LOG=$WORK/out/summary.log
 env $COMMON VIY_LOG_LEVEL=1 VIY_MAX_EPOCHS=1 VIY_PERSIST_EVIDENCE=0 \
+  VIY_WORKERS=0 \
   "$IDAT" -A -c -o"$WORK/out/summary.i64" -L"$SUMMARY_LOG" \
   -S"$ROOT/tests/ida_worker_smoke.py" "$INPUT"
 python3 "$OBSERVABILITY_VERIFY" summary "$SUMMARY_LOG"
@@ -132,13 +130,9 @@ if ! grep -Eq '0 data xref\(s\)' "$NO_DREF_LOG"; then
   exit 1
 fi
 
-# Remove the companion engine entirely and prove both IDA-only producers still
-# run through the real plugin lifecycle and persist their own provenance. The
+# Disable the embedded engine and prove both IDA-only producers still run
+# through the real plugin lifecycle and persist their own provenance. The
 # fixture contains deterministic opposite-branch and wrapper shapes.
-COMPANION=$WORK/user/plugins/viy/$(basename "$RAX_LIB")
-DISABLED_COMPANION=$COMPANION.disabled
-mv "$COMPANION" "$DISABLED_COMPANION"
-trap 'test ! -f "$DISABLED_COMPANION" || mv "$DISABLED_COMPANION" "$COMPANION"' EXIT HUP INT TERM
 for provider in native deobf; do
   PROVIDER_DB=$WORK/out/$provider-only.i64
   PROVIDER_LOG=$WORK/out/$provider-only.log
@@ -149,7 +143,7 @@ for provider in native deobf; do
     PRODUCER=viy.deobf.ida
     PROVIDER_ENV="VIY_NATIVE=0 VIY_DEOBF=1"
   fi
-  env IDAUSR="$WORK/user" VIY_RAX_PATH="$WORK/out/does-not-exist.dylib" \
+  env IDAUSR="$WORK/user" VIY_RAX_DISABLE=1 \
     VIY_STATIC=0 VIY_MAX_EPOCHS=1 VIY_PERSIST_EVIDENCE=1 \
     VIY_LOG_LEVEL=2 VIY_PROGRESS_INTERVAL_MS=100 \
     VIY_COMMENTS=0 VIY_WANT_DREFS=0 VIY_EXPECT_PRODUCER="$PRODUCER" \
@@ -162,7 +156,5 @@ for provider in native deobf; do
   fi
   python3 "$OBSERVABILITY_VERIFY" "$provider" "$PROVIDER_LOG"
 done
-mv "$DISABLED_COMPANION" "$COMPANION"
-trap - EXIT HUP INT TERM
 
 echo "VIY_EVIDENCE_PERSISTENCE passed; logs: $WORK/out"

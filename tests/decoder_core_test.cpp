@@ -238,7 +238,7 @@ void require_real_decoder(const RaxApi *api)
               << rax_unavailable_reason() << '\n';
     std::exit(2);
   }
-  std::cout << "SKIP: compatible librax with rax_decode not available\n";
+  std::cout << "SKIP: compatible linked rax_decode not available\n";
   std::exit(77);
 }
 

@@ -298,12 +298,39 @@ near/far operands. Disposable x86-64 and ARM64 IDBs test that assumption: all
 each fixture retains one indirect-transfer annotation and persisted SMIR
 evidence. The Release plugin build and all 18 CTest cases pass.
 
-**Medium-impact adjacent finding:** runtime pointer-table comments currently
+**Medium-impact adjacent finding:** the former runtime pointer-table comments
 describe a heuristic, not a recovered type. Two adjacent slots, each with one
 observed in-image target across at least two runs and no conflicting writes,
 can qualify when at least one target is executable or a same-function execution
 edge follows a matching pointer read. That correlation is not def-use proof
-and does not distinguish direct from indirect edges. The repeatable comment
-is attached to the first data slot and can therefore appear at multiple code
+and does not distinguish direct from indirect edges. The old repeatable comment
+was attached to the first data slot and could therefore appear at multiple code
 references. Adjacent globals/import slots can satisfy these conditions; the
 object type in the supplied screenshot is unknown.
+
+Pointer-slot annotations now report only the number of adjacent slots and the
+minimum number of agreeing runs per slot. They are non-repeatable comments at
+the first data slot; neither table structure nor indirect use is asserted.
+Per-slot offset materialization retains its existing byte and undefined-data
+guards and does not create an aggregate table type.
+
+On re-observing a cluster, an exact legacy generated repeatable comment for
+that slot count (with or without the old indirect-use suffix) is removed only
+after the replacement local comment exists. Edited repeatable comments and
+conflicting local comments are preserved. This is incremental migration, not
+a whole-database cleanup: unvisited or no-longer-observed clusters keep their
+old comments. The running IDA process must load the rebuilt plugin first.
+
+Assumption register: exact legacy text identifies the generated annotation;
+an analyst copying the identical text is indistinguishable without historical
+ownership metadata. The migration accepts no extra text. Tests probe both
+legacy forms, appended analyst text, and a conflicting local comment. The
+minimum run count describes each slot individually, not necessarily the same
+set of runs across all slots. Computing it takes O(S) time and O(1) auxiliary
+space for S slots; existing observation collection costs are unchanged.
+
+Validation uses `tests/fixtures/pointer_observations.c`, compiled with
+`xcrun clang -O1 -g` for ARM64 and with `-arch x86_64` for x86-64. Fresh disposable
+IDBs run `tests/ida_pointer_comments_smoke.py` with `VIY_POINTER_COMMENT_CASE`
+set to each of `fresh`, `legacy`, `correlated`, `edited`, and `local-conflict`.
+The assertions check the actual IDB comment slots, migration, and preservation.

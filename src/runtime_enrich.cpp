@@ -526,7 +526,7 @@ struct PointerEvidence
   PointerKey key;
   std::set<RunKey> runs;
   bool from_final_write = false;
-  bool indirect_correlated = false;
+  bool execution_correlated = false;
 };
 
 std::map<PointerKey, PointerEvidence> collect_pointer_evidence(
@@ -562,7 +562,8 @@ std::map<PointerKey, PointerEvidence> collect_pointer_evidence(
         {
           // The memory read is ordered before this same-run edge by the shared
           // hook sequence; normalization preserves repeated ordered events.
-          evidence.indirect_correlated = true;
+          // Temporal/target agreement is not proof of an indirect def-use chain.
+          evidence.execution_correlated = true;
           break;
         }
       }
@@ -646,7 +647,7 @@ void apply_pointer_cluster(const ProgramImage &img, const EmuEvents &events,
   });
   const bool correlated = std::any_of(cluster.begin(), cluster.end(), [](const StablePointer &p)
   {
-    return p.evidence.indirect_correlated;
+    return p.evidence.execution_correlated;
   });
   if ( !has_code_target && !correlated )
     return;
@@ -656,10 +657,33 @@ void apply_pointer_cluster(const ProgramImage &img, const EmuEvents &events,
     ++stats.pointer_clusters_correlated;
   if ( cfg.want_comments )
   {
+    size_t min_runs = cluster.front().evidence.runs.size();
+    for ( const StablePointer &pointer : cluster )
+      min_runs = std::min(min_runs, pointer.evidence.runs.size());
     qstring text;
-    text.sprnt("viy: corroborated runtime pointer table (%u contiguous slot(s))%s",
-               (unsigned)cluster.size(), correlated ? "; indirect use observed" : "");
-    account_comment(add_repeatable_comment((ea_t)base, text.c_str()), stats);
+    text.sprnt("viy: %u adjacent pointer slots; values repeated in at least %u runs per slot",
+               (unsigned)cluster.size(), (unsigned)min_runs);
+    // Adjacency establishes neither a table nor an indirect-use chain. Keep
+    // this observation at the data address, without propagating it to callers.
+    qstring current;
+    const bool existing = get_cmt(&current, (ea_t)base, false) > 0 && !current.empty();
+    const bool ready = existing ? current == text : set_cmt((ea_t)base, text.c_str(), false);
+    account_comment(existing ? CommentResult::Existing
+                             : ready ? CommentResult::Added : CommentResult::Failed, stats);
+    if ( ready )
+    {
+      // Migrate only an exact legacy annotation for this revalidated cluster.
+      // Preserve edited repeatable comments and conflicting local comments.
+      qstring legacy;
+      legacy.sprnt("viy: corroborated runtime pointer table (%u contiguous slot(s))",
+                   (unsigned)cluster.size());
+      qstring repeatable;
+      if ( get_cmt(&repeatable, (ea_t)base, true) > 0
+        && (repeatable == legacy || repeatable == legacy + "; indirect use observed") )
+      {
+        set_cmt((ea_t)base, "", true);
+      }
+    }
   }
 
   for ( const StablePointer &pointer : cluster )

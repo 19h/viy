@@ -288,8 +288,10 @@ final dirty ranges and can:
   execution in the same `(run_id, seed)` using shared hook sequence numbers;
 
 - cluster at least two contiguous, stable pointer slots, requiring a code
-  target or a pointer read that precedes a matching indirect edge in the same
-  `(run_id, seed)` before materializing offsets;
+  target or a pointer read that precedes a matching execution edge in the same
+  `(run_id, seed)` before materializing offsets. Adjacency and temporal agreement
+  do not establish a table or indirect def-use chain. A non-repeatable comment
+  at the first slot reports only the slot count and minimum agreeing run count;
 
 - promote a corroborated call target only when it is executable, unowned, and
   a valid code head (or can safely be made code); and
@@ -513,13 +515,13 @@ documented clamps are applied.
 | `VIY_STRINGS` | `1` | Create ordinary C strings at observed data reads. |
 | `VIY_RUNTIME_STRINGS` | `1` | Reconstruct NUL-terminated and bounded Pascal8/Pascal16/Pascal32 strings from exact final writes. |
 | `VIY_UNICODE_STRINGS` | `1` | Consider UTF-16/UTF-32 as well as strict UTF-8/ASCII runtime strings. |
-| `VIY_TABLES` | `1` | Detect corroborated contiguous runtime pointer tables. |
+| `VIY_TABLES` | `1` | Observe adjacent stable pointer slots and materialize eligible offsets. |
 | `VIY_FUNCTION_RECOVERY` | `1` | Permit guarded promotion of orphan call targets/function evidence. |
 | `VIY_TAIL_RECOVERY` | `0` | Share an already-defined exact tail with a corroborated owner. Candidate comments do not require this opt-in. |
 | `VIY_SMC_EVIDENCE` | `1` | Detect/comment changed writes to executable image bytes and execution correlation. |
 | `VIY_APPLY_RUNTIME_BYTES` | `0` | Explicitly allow guarded runtime-byte patching. |
 | `VIY_MAX_RUNTIME_BYTES` | `1048576` | Maximum exact final-write capture per run and patch budget per function pass; capped at 64 MiB. `0` disables capture/patching. |
-| `VIY_COMMENTS` | `1` | Allow viy repeatable comments. |
+| `VIY_COMMENTS` | `1` | Allow viy comments. Pointer-slot observations stay local to their data address. |
 
 ### Function-level and decompiler behavior
 

@@ -86,7 +86,7 @@ ProgramImage split_x64_image(uint32_t code_permissions)
   result.lo = 0x100000;
   result.hi = 0x103000;
   result.generation = 7;
-  for ( const auto description : {
+  for ( const auto &description : {
           std::pair<uint64_t, uint32_t>{0x100000, code_permissions},
           std::pair<uint64_t, uint32_t>{0x102000, 6u} } )
   {

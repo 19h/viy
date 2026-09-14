@@ -127,3 +127,16 @@ check does not claim a Linux plugin or RAX archive link.
 
 The published `v1.0.0` tag identifies the original workflow commit `ff3acea`.
 Repair commits do not automatically change that tag or rebuild its release.
+
+
+The follow-up run [34823157816](https://github.com/19h/viy/actions/runs/34823157816)
+linked both Linux plugins, then failed compiling `tests/emu_evidence_test.cpp`:
+Ubuntu GCC 13.3 rejects a range-loop copy of a `std::pair` under
+`-Werror=range-loop-construct`. The fixture now binds the pair by const reference.
+The earlier local GCC 13.4 compile did not emit this diagnostic; compiler patch
+versions are therefore distinguished in verification results.
+
+The corrected fixtures also pass an Ubuntu 24.04 GCC 13.3 check: all 17 C++
+test targets compile with Release warnings-as-errors; 13 SDK/RAX-independent
+executables run successfully. Four RAX-linked targets were compile-checked in
+that container and executed in the native macOS 17-case CTest run.

@@ -2,6 +2,7 @@
  * native_analysis.cpp -- conservative, non-mutating IDA-native analysis.
  */
 #include "native_analysis.hpp"
+#include "xref_lookup.hpp"
 #include "evidence_store.hpp"
 
 #include <algorithm>
@@ -170,14 +171,7 @@ ea_t branch_target(const insn_t &insn)
 bool has_exact_code_xref(ea_t from, ea_t to)
 {
   xrefblk_t xb;
-  for ( bool ok = xb.first_from(from, XREF_CODE); ok; ok = xb.next_from() )
-  {
-    if ( !xb.iscode )
-      break;
-    if ( xb.to == to )
-      return true;
-  }
-  return false;
+  return viy_code_xref_exists(xb, from, to, XREF_CODE, XREF_NOFLOW);
 }
 
 bool has_alternate_predecessor(ea_t at, ea_t linear_predecessor)

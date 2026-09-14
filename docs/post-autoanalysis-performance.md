@@ -113,3 +113,80 @@ probes are explicit; the sampled hotspot and scheduling path are covered;
 timings use seconds and are scoped to the measured component; generation,
 ordering and lifetime edge cases have differential regressions; provenance is
 the supplied profile and repository source; scope limits are recorded above.
+
+
+## Xref traversal follow-up
+
+The next supplied profile contained 2,421 main-thread samples, including 2,289
+in `viy_apply_missing`, dominated by `xrefblk_t::next_from()` and data-reference
+iteration. Each existence check restarted at the first outgoing xref. As a
+single source acquired N distinct targets, those checks performed O(N²) cursor
+steps. Repeated observations also rewalked existing references.
+
+Exact data/code checks now use the documented SDK
+`xrefblk_t::next_from(from, after, flags)` overload to seek immediately after
+`target - 1`. Address zero uses `first_from`, and ordinary code flow is checked
+separately because it precedes the sorted non-flow group. This affects computed
+reference application, shared code-reference insertion, and the native
+provider's exact-code-reference check. It preserves existing xref types and
+per-reference IDB reads; no cache hides additions or deletions by other plugins.
+
+The primary API contract is in the pinned SDK's `src/include/xref.hpp`, at the
+three-argument `next_from` overload. The new helper performs a bounded number
+of cursor operations and uses O(1) auxiliary space. Kernel lookup complexity
+is supplied by IDA; with logarithmic index seeks, N queries are O(N log N).
+
+`tests/xref_lookup_test.cpp` exercises 50,001 data targets and over 100,000
+queries, zero/maximal addresses, missing targets, fall-through ordering, empty
+sets and intervening mutations. Its cursor deliberately has no linear-advance
+overload, and operation-count checks prevent scan regressions.
+`tests/ida_xref_lookup_smoke.py` also passed in an isolated, disposable IDB on
+installed IDA 9.4: all queried addresses agreed with the known reference set,
+including zero, code flow, and mutations. For 1,000 absent-target queries over
+1,025 data refs, the Python-bound old traversal took 0.295 s and the seek took
+0.00152 s (one run, approximately 194×). This measures lookup, not insertion
+callbacks or complete analysis. macOS Release build, 17 CTest cases, GCC 13.4
+xref regression, and the xref ASan/UBSan regression passed.
+
+Run the licensed smoke script only on a disposable x86 IDB using
+`VIY_XREF_TEST_RESULT=/path/to/result.json idat -A -S/path/to/ida_xref_lookup_smoke.py /path/to/disposable.i64`.
+It creates and mutates a fixture segment at address zero.
+
+The user's subsequent sample at 10:38:04 contained 489 main-thread samples:
+361/489 = 73.8% waited in the event loop, 91/489 = 18.6% entered viy's timer,
+and seven entered reference application. This is consistent with relief of
+the reported main-thread monopolization; it is not a controlled end-to-end
+speedup or an assessment of worker-thread CPU usage.
+
+**Medium-impact remaining opportunity:** 41 samples entered instruction-effect
+analysis, primarily RAX's JSON-producing oracle. The current pinned
+`capi/src/analyze.rs::rax_analyze` always calls `decode_to_json` and then projects
+SMIR JSON into effects. viy's caller already provides a preallocated effect
+buffer to avoid the normal two-call sizing protocol. The public C API has no
+non-JSON equivalent preserving these effects; substituting decode-only or
+skipping ordinary instructions would lose evidence. A typed SMIR projection
+belongs in RAX and requires separate differential validation.
+
+Additional assumption: the arbitrary-target seek behaves as documented on the
+user's alpha IDA build. The stable 9.4 disposable-IDB test validates the API
+contract; the user's later sample supports improved occupancy on the alpha
+build, but neither proves a hard per-callback latency bound.
+
+## Data references into instruction tails
+
+Read-only inspection of `libclpx.dylib` on the user's IDA 9.4 alpha confirmed
+`0x30940 -> 0x3446D` as a user-marked `dr_R` reference. The target is a tail
+byte of the instruction at `0x3446C`; analogous references cover all three
+tail bytes of successive ARM64 instructions. The source is an `LDP` in
+`ClpModel::addRows`. `is_code(get_flags(target))` is false on these tails.
+The data-reference gate now checks `get_item_head(target)` before classifying
+code. This rejects both instruction heads and interiors while retaining data
+item interiors such as structure fields. The disposable-IDB smoke test checks
+both cases and passes, as do the Release build and all 17 CTest cases.
+
+Attribution remains unknown: Chernobog's `src/ida_analysis/evidence_apply.cpp`
+contains the same target-byte guard, and `XREF_USER` does not identify the
+producer. **High-impact shared defect:** either plugin can accept instruction
+tails through this predicate. Existing references were not removed from the
+live IDB. The assumption that viy alone inserted them is not established;
+falsify it by tracing insertion callbacks with one producer enabled at a time.

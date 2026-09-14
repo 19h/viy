@@ -3,6 +3,7 @@
  * and add only the ones the main analysis missed. Main thread only.
  */
 #include "ref_discovery.hpp"
+#include "xref_lookup.hpp"
 
 #include <pro.h>
 #include <idp.hpp>
@@ -20,20 +21,14 @@ namespace {
 bool cref_exists(ea_t from, ea_t to)
 {
   xrefblk_t xb;
-  for ( bool ok = xb.first_from(from, XREF_CODE); ok; ok = xb.next_from() )
-    if ( xb.to == to )
-      return true;
-  return false;
+  return viy_code_xref_exists(xb, from, to, XREF_CODE, XREF_NOFLOW);
 }
 
 // Does a data ref already exist from->to? (XREF_DATA returns only drefs.)
 bool dref_exists(ea_t from, ea_t to)
 {
   xrefblk_t xb;
-  for ( bool ok = xb.first_from(from, XREF_DATA); ok; ok = xb.next_from() )
-    if ( xb.to == to )
-      return true;
-  return false;
+  return viy_sorted_xref_exists(xb, from, to, XREF_DATA);
 }
 
 // A code target must live in an executable segment (perm==0 means "no info",
@@ -134,7 +129,10 @@ RefStats viy_apply_missing(const EmuEvents &ev, const ViyConfig &cfg)
 
     if ( !is_mapped(to) )
       continue;
-    if ( is_code(get_flags(to)) )       // executing code, not a data reference
+    // Instruction interiors have FF_TAIL, not FF_CODE. Classify their owning
+    // item or a bytewise/speculative read can attach a dref to every code tail.
+    // Data-item interiors remain valid targets (structure fields, arrays).
+    if ( is_code(get_flags(get_item_head(to))) )
       continue;
     const flags64_t ff = get_flags(from);
     if ( !is_head(ff) || !is_code(ff) )

@@ -216,6 +216,18 @@ elseif(UNIX)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(viy_xref_lookup_tests tests/xref_lookup_test.cpp)
+  target_include_directories(viy_xref_lookup_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_features(viy_xref_lookup_tests PRIVATE cxx_std_17)
+  viy_harden_test_target(viy_xref_lookup_tests)
+  if(VIY_TEST_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(viy_xref_lookup_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(viy_xref_lookup_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+  endif()
+  add_test(NAME viy.xref_lookup COMMAND viy_xref_lookup_tests)
+
   add_executable(viy_evidence_tests
     tests/evidence_store_test.cpp
     src/analysis_facts.cpp

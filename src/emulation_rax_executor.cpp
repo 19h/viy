@@ -12,7 +12,7 @@ class RaxEmulationExecutor final : public EmulationExecutor
 {
 public:
   explicit RaxEmulationExecutor(const RaxWorkerOptions &options)
-    : image_(options.image)
+    : image_(options.image), api_(options.api)
   {
     if ( options.api == nullptr )
     {
@@ -35,7 +35,8 @@ public:
 
   bool available() const noexcept override
   {
-    return driver_ != nullptr;
+    return image_ != nullptr && api_ != nullptr
+        && (driver_ != nullptr || api_->decode != nullptr || api_->analyze != nullptr);
   }
 
   std::string unavailable_reason() const override
@@ -48,7 +49,7 @@ public:
   {
     EmulationJobResult result;
     result.function_start = job.function.start;
-    if ( driver_ == nullptr || image_ == nullptr )
+    if ( !available() )
     {
       result.status = EmulationJobStatus::UNAVAILABLE;
       result.diagnostic = unavailable_;
@@ -77,6 +78,25 @@ public:
         result.diagnostic = "duplicate emulation run provenance";
         return result;
       }
+    }
+
+    result.decoder_audit.reserve(job.decoder_inputs.size());
+    for (const DecoderAuditInput &input : job.decoder_inputs)
+    {
+      if (cancel.cancelled())
+      {
+        result.status = EmulationJobStatus::CANCELLED;
+        result.diagnostic = "decoder audit generation cancelled";
+        result.decoder_audit.clear();
+        return result;
+      }
+      result.decoder_audit.push_back(viy_analyze_decoder_input(api_, *image_, input));
+    }
+    if (driver_ == nullptr && !job.runs.empty())
+    {
+      result.status = EmulationJobStatus::UNAVAILABLE;
+      result.diagnostic = unavailable_;
+      return result; // Static evidence remains usable when emulation is unavailable.
     }
 
     result.runs.reserve(job.runs.size());
@@ -117,6 +137,7 @@ public:
 
 private:
   std::shared_ptr<const ProgramImage> image_;
+  const RaxApi *api_ = nullptr;
   std::unique_ptr<EmuDriver> driver_;
   std::string unavailable_;
 };

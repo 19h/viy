@@ -1,6 +1,7 @@
 #include "decoder_audit.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -177,155 +178,172 @@ void DecoderAuditStats::merge_from(const DecoderAuditStats &other)
 #undef VIY_MERGE_SMIR
 }
 
-DecoderAuditStats viy_audit_decoders(const RaxApi *api,
-                                     const ProgramImage &image,
-                                     const FuncRange &function,
-                                     analysis::EvidenceStore &store)
+std::vector<DecoderAuditInput> viy_snapshot_decoder_audit(
+    const ProgramImage &image, const FuncRange &function)
 {
-  DecoderAuditStats stats;
-  if ( api == nullptr || (api->decode == nullptr && api->analyze == nullptr) )
-    return stats;
+  std::vector<DecoderAuditInput> inputs;
   const DecoderArchitecture arch =
       viy_decoder_architecture(image.arch, image.big_endian);
-  if ( !arch.valid )
-    return stats;
+  if (!arch.valid)
+    return inputs;
   const int thumb_reg = arch.per_instruction_thumb ? str2reg("T") : -1;
-
   std::vector<FuncChunk> chunks = function.chunks;
-  if ( chunks.empty() && function.end > function.start )
-    chunks.push_back(FuncChunk{ function.start, function.end });
-  constexpr size_t kMaximumBytes = 16;
-  constexpr size_t kMaximumInstructions = 65536;
-  size_t budget = kMaximumInstructions;
-  for ( const FuncChunk &chunk : chunks )
+  if (chunks.empty() && function.end > function.start)
+    chunks.push_back(FuncChunk{function.start, function.end});
+  size_t budget = 65536;
+  for (const FuncChunk &chunk : chunks)
   {
     ea_t ea = ea_t(chunk.start);
     const ea_t end = ea_t(chunk.end);
-    while ( ea != BADADDR && ea < end && budget != 0 )
+    while (ea != BADADDR && ea < end && budget != 0)
     {
       --budget;
       const flags64_t flags = get_flags(ea);
-      if ( is_code(flags) && is_head(flags) )
+      if (is_code(flags) && is_head(flags))
       {
-        insn_t ida_instruction;
-        if ( decode_insn(&ida_instruction, ea) > 0 && ida_instruction.size != 0 )
+        insn_t instruction;
+        if (decode_insn(&instruction, ea) > 0 && instruction.size != 0)
         {
-          ++stats.instructions_compared;
-          const size_t wanted = viy_decoder_window_size(
-              uint64_t(ea), uint64_t(end), kMaximumBytes);
-          const LoadedByteView bytes = image.loaded_view(uint64_t(ea), wanted);
-          const size_t offered = bytes.size;
-          uint32_t mode = 0;
-          const bool mode_known = viy_decoder_mode(
-              arch, arm_state_at(arch, ea, thumb_reg), mode);
-          DecoderDecodeResult rax_result;
-          rax_result.status = DecoderDecodeStatus::InvalidInput;
-          bool analyzer_returned = false;
-          if ( offered != 0 && mode_known )
-          {
-            SmirInstructionAnalysis effects;
-            if ( viy_analyze_instruction_effects(
-                    api, image, uint64_t(ea), mode, effects, offered) )
-            {
-              analyzer_returned = true;
-              rax_result = viy_accept_rax_decoded(
-                  effects.summary.decoded, offered);
-              SmirAnalysisStats recorded;
-              if ( rax_result.status == DecoderDecodeStatus::Valid )
-                recorded = viy_record_smir_analysis(effects, function, store);
-#define VIY_ADD_SMIR(field) stats.smir.field += recorded.field
-              VIY_ADD_SMIR(instructions_analyzed);
-              VIY_ADD_SMIR(unsupported);
-              VIY_ADD_SMIR(partial);
-              VIY_ADD_SMIR(register_constant_facts);
-              VIY_ADD_SMIR(memory_access_facts);
-              VIY_ADD_SMIR(code_target_facts);
-              VIY_ADD_SMIR(observations_inserted);
-              VIY_ADD_SMIR(observations_deduplicated);
-              VIY_ADD_SMIR(observations_rejected);
-#undef VIY_ADD_SMIR
-            }
-          }
-          // rax_analyze already embeds the identical decoded-flow summary. Do
-          // not lift the instruction again merely to call rax_decode; retain a
-          // 1.2 fallback when the richer optional capability is absent. If an
-          // analyzer result itself is malformed, reject it consistently rather
-          // than masking a cross-capability ABI disagreement with another call.
-          if ( !analyzer_returned && offered != 0 && mode_known )
-            rax_result = viy_decode_one(api->decode, arch.rax_arch, mode,
-                                        uint64_t(ea), bytes.data, offered);
-          if ( rax_result.status != DecoderDecodeStatus::Valid )
-          {
-            ++stats.rax_decode_failures;
-            emit_region(store, stats, function, ea, ida_instruction.size,
-                        CodeRegionKind::Unknown, 6000,
-                        "IDA decoded a code item but rax rejected the same bytes");
-          }
-          else
-          {
-            const DecoderInstruction ida_model =
-                ida_instruction_model(ida_instruction);
-            const DecoderInstruction &rax_model = rax_result.instruction;
-            const DecoderComparison comparison =
-                viy_compare_decoders(ida_model, rax_model);
-            if ( comparison.size_disagreement )
-            {
-              ++stats.size_disagreements;
-              std::ostringstream detail;
-              detail << "IDA size=" << unsigned(ida_instruction.size)
-                     << "; rax size=" << rax_model.size;
-              emit_region(store, stats, function, ea,
-                          std::max<uint64_t>(rax_model.size, ida_instruction.size),
-                          CodeRegionKind::Mixed, 8500, detail.str());
-            }
-
-            if ( comparison.flow_disagreement )
-            {
-              ++stats.flow_disagreements;
-              std::string detail = std::string("IDA flow=")
-                                 + viy_decoder_flow_name(ida_model.flow)
-                                 + "; rax flow="
-                                 + viy_decoder_flow_name(rax_model.flow);
-              emit_region(store, stats, function, ea,
-                          std::max<uint64_t>(rax_model.size, ida_instruction.size),
-                          CodeRegionKind::Mixed, 8000, detail);
-            }
-
-            if ( comparison.right_target.valid )
-            {
-              const CodeTargetKind target_kind =
-                  comparison.right_target.kind == DecoderTargetKind::Call
-                ? CodeTargetKind::Call : CodeTargetKind::Jump;
-              emit_target(store, stats, function, ea,
-                          comparison.right_target.address, target_kind,
-                          "viy.rax.decoder", "direct-control-target",
-                          ProofKind::StaticProof, 9800,
-                          "direct target encoded in the instruction");
-            }
-
-            if ( comparison.left_target.valid )
-            {
-              const CodeTargetKind ida_kind =
-                  comparison.left_target.kind == DecoderTargetKind::Call
-                ? CodeTargetKind::Call : CodeTargetKind::Jump;
-              emit_target(store, stats, function, ea,
-                          comparison.left_target.address, ida_kind,
-                          "ida.decoder", "direct-control-target",
-                          ProofKind::Imported, 9500,
-                          "direct target reported by IDA's processor module");
-            }
-            if ( comparison.target_disagreement )
-              ++stats.target_disagreements;
-          }
+          DecoderAuditInput input;
+          input.address = uint64_t(ea);
+          input.maximum_bytes = viy_decoder_window_size(input.address, chunk.end, 16);
+          input.mode_known = viy_decoder_mode(
+              arch, arm_state_at(arch, ea, thumb_reg), input.mode);
+          input.ida = ida_instruction_model(instruction);
+          input.control_transfer =
+              (instruction.get_canon_feature(PH) & (CF_CALL | CF_JUMP | CF_STOP)) != 0;
+          inputs.push_back(input);
         }
       }
       const ea_t next = next_head(ea, end);
-      if ( next == BADADDR || next <= ea )
+      if (next == BADADDR || next <= ea)
         break;
       ea = next;
     }
-    if ( budget == 0 )
+    if (budget == 0)
       break;
+  }
+  return inputs;
+}
+
+void viy_discard_stale_decoder_audit(
+    const ProgramImage &image, std::vector<DecoderAuditInstruction> &instructions)
+{
+  const DecoderArchitecture arch =
+      viy_decoder_architecture(image.arch, image.big_endian);
+  const int thumb_reg = arch.per_instruction_thumb ? str2reg("T") : -1;
+  instructions.erase(std::remove_if(instructions.begin(), instructions.end(),
+      [&](const DecoderAuditInstruction &instruction)
+  {
+    const DecoderAuditInput &input = instruction.input;
+    const ea_t ea = ea_t(input.address);
+    const flags64_t flags = get_flags(ea);
+    if (!is_code(flags) || !is_head(flags) || get_item_size(ea) != input.ida.size)
+      return true;
+    uint32_t mode = 0;
+    const bool known = viy_decoder_mode(arch, arm_state_at(arch, ea, thumb_reg), mode);
+    if (known != input.mode_known || (known && mode != input.mode))
+      return true;
+    const LoadedByteView bytes = image.loaded_view(input.address, input.maximum_bytes);
+    uint8_t current[16] = {};
+    if (bytes.size > sizeof(current))
+      return true;
+    return bytes.size != 0
+        && (get_bytes(current, ssize_t(bytes.size), ea, GMB_READALL) != ssize_t(bytes.size)
+            || std::memcmp(current, bytes.data, bytes.size) != 0);
+  }), instructions.end());
+}
+
+DecoderAuditStats viy_record_decoder_audit(
+    const FuncRange &function,
+    const std::vector<DecoderAuditInstruction> &instructions,
+    analysis::EvidenceStore &store)
+{
+  DecoderAuditStats stats;
+  for (const DecoderAuditInstruction &instruction : instructions)
+  {
+    ++stats.instructions_compared;
+    const ea_t ea = ea_t(instruction.input.address);
+    const DecoderInstruction &ida_model = instruction.input.ida;
+    const DecoderDecodeResult &rax_result = instruction.decoded;
+    if (instruction.analyzed)
+    {
+      SmirAnalysisStats recorded;
+      if ( rax_result.status == DecoderDecodeStatus::Valid )
+        recorded = viy_record_smir_analysis(instruction.effects, function, store);
+#define VIY_ADD_SMIR(field) stats.smir.field += recorded.field
+      VIY_ADD_SMIR(instructions_analyzed);
+      VIY_ADD_SMIR(unsupported);
+      VIY_ADD_SMIR(partial);
+      VIY_ADD_SMIR(register_constant_facts);
+      VIY_ADD_SMIR(memory_access_facts);
+      VIY_ADD_SMIR(code_target_facts);
+      VIY_ADD_SMIR(observations_inserted);
+      VIY_ADD_SMIR(observations_deduplicated);
+      VIY_ADD_SMIR(observations_rejected);
+#undef VIY_ADD_SMIR
+    }
+    if ( rax_result.status != DecoderDecodeStatus::Valid )
+    {
+      ++stats.rax_decode_failures;
+      emit_region(store, stats, function, ea, ida_model.size,
+                  CodeRegionKind::Unknown, 6000,
+                  "IDA decoded a code item but rax rejected the same bytes");
+    }
+    else
+    {
+      const DecoderInstruction &rax_model = rax_result.instruction;
+      const DecoderComparison comparison =
+          viy_compare_decoders(ida_model, rax_model);
+      if ( comparison.size_disagreement )
+      {
+        ++stats.size_disagreements;
+        std::ostringstream detail;
+        detail << "IDA size=" << unsigned(ida_model.size)
+               << "; rax size=" << rax_model.size;
+        emit_region(store, stats, function, ea,
+                    std::max<uint64_t>(rax_model.size, ida_model.size),
+                    CodeRegionKind::Mixed, 8500, detail.str());
+      }
+
+      if ( comparison.flow_disagreement )
+      {
+        ++stats.flow_disagreements;
+        std::string detail = std::string("IDA flow=")
+                           + viy_decoder_flow_name(ida_model.flow)
+                           + "; rax flow="
+                           + viy_decoder_flow_name(rax_model.flow);
+        emit_region(store, stats, function, ea,
+                    std::max<uint64_t>(rax_model.size, ida_model.size),
+                    CodeRegionKind::Mixed, 8000, detail);
+      }
+
+      if ( comparison.right_target.valid )
+      {
+        const CodeTargetKind target_kind =
+            comparison.right_target.kind == DecoderTargetKind::Call
+          ? CodeTargetKind::Call : CodeTargetKind::Jump;
+        emit_target(store, stats, function, ea,
+                    comparison.right_target.address, target_kind,
+                    "viy.rax.decoder", "direct-control-target",
+                    ProofKind::StaticProof, 9800,
+                    "direct target encoded in the instruction");
+      }
+
+      if ( comparison.left_target.valid )
+      {
+        const CodeTargetKind ida_kind =
+            comparison.left_target.kind == DecoderTargetKind::Call
+          ? CodeTargetKind::Call : CodeTargetKind::Jump;
+        emit_target(store, stats, function, ea,
+                    comparison.left_target.address, ida_kind,
+                    "ida.decoder", "direct-control-target",
+                    ProofKind::Imported, 9500,
+                    "direct target reported by IDA's processor module");
+      }
+      if ( comparison.target_disagreement )
+        ++stats.target_disagreements;
+    }
   }
   return stats;
 }

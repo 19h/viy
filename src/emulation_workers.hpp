@@ -19,6 +19,7 @@
 #include "emu_driver.hpp"
 #include "program_model.hpp"
 #include "viy_config.hpp"
+#include "decoder_audit.hpp"
 
 namespace viy {
 
@@ -38,6 +39,7 @@ struct EmulationJob
   FuncRange function;
   ViyConfig config;
   std::vector<EmulationRunRequest> runs;
+  std::vector<DecoderAuditInput> decoder_inputs;
 };
 
 struct EmulationRunResult
@@ -65,6 +67,7 @@ struct EmulationJobResult
   std::string diagnostic;
   std::vector<EmulationRunResult> runs;
   EmuEvents merged;
+  std::vector<DecoderAuditInstruction> decoder_audit;
 
   bool completed() const { return status == EmulationJobStatus::COMPLETED; }
 };
@@ -142,8 +145,10 @@ uint64_t viy_emulation_job_fingerprint(
 class EmulationWorkerPool
 {
 public:
-  // max_queued_jobs==0 means no explicit queue limit. A bounded value makes
-  // try_submit() provide backpressure without ever blocking IDA's main thread.
+  // max_queued_jobs==0 means no explicit queue limit. A bounded value limits
+  // pending jobs and total undelivered work to max_queued_jobs + worker_count,
+  // so ordered completion cannot grow an unlimited result buffer. try_submit()
+  // supplies backpressure without ever blocking IDA's main thread.
   EmulationWorkerPool(size_t worker_count, EmulationExecutorFactory factory,
                       size_t max_queued_jobs = 0);
   ~EmulationWorkerPool();

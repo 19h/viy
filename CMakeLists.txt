@@ -186,6 +186,7 @@ ida_add_plugin(viy
     src/evidence_apply.cpp
     src/decoder_core.cpp
     src/decoder_audit.cpp
+    src/decoder_audit_core.cpp
     src/smir_analysis.cpp
     src/hexrays_bridge.cpp
     src/native_analysis.cpp
@@ -346,6 +347,26 @@ if(BUILD_TESTING)
   target_compile_features(viy_hexrays_bridge_tests PRIVATE cxx_std_17)
   target_compile_definitions(viy_hexrays_bridge_tests PRIVATE VIY_WITH_HEXRAYS_SDK=0)
   viy_harden_test_target(viy_hexrays_bridge_tests)
+
+  add_executable(viy_decoder_worker_tests
+    tests/decoder_worker_test.cpp
+    src/emulation_workers.cpp
+    src/emulation_rax_executor.cpp
+    src/emu_driver.cpp
+    src/abi_policy.cpp
+    src/decoder_audit_core.cpp
+    src/decoder_core.cpp
+    src/smir_analysis.cpp
+    src/program_model_core.cpp
+    src/rax_loader.cpp
+    src/analysis_facts.cpp
+    src/evidence_store.cpp)
+  target_include_directories(viy_decoder_worker_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${RAX_CAPI_DIR}/include")
+  target_compile_features(viy_decoder_worker_tests PRIVATE cxx_std_17)
+  target_link_libraries(viy_decoder_worker_tests PRIVATE rax::rax_static Threads::Threads)
+  viy_harden_test_target(viy_decoder_worker_tests)
+  add_test(NAME viy.decoder_workers COMMAND viy_decoder_worker_tests)
 
   add_executable(viy_smir_analysis_tests
     tests/smir_analysis_test.cpp

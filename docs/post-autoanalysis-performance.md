@@ -190,3 +190,55 @@ producer. **High-impact shared defect:** either plugin can accept instruction
 tails through this predicate. Existing references were not removed from the
 live IDB. The assumption that viy alone inserted them is not established;
 falsify it by tracing insertion callbacks with one producer enabled at a time.
+
+## Decoder audit worker boundary
+
+The 10:46:42 sample shows 461/714 = 64.6% of main-thread samples in viy's timer,
+including 275/714 = 38.5% in instruction-effect analysis and 217/714 = 30.4% in
+RAX's JSON oracle. The previous 73.8% event-loop wait fraction was one sample
+window, not evidence that all later analysis phases were responsive.
+
+The decoder audit now has three explicit stages:
+
+1. The main thread snapshots IDA instruction heads, decoder projections,
+   ARM/Thumb modes and chunk-limited decode windows into the submitted job.
+2. The worker executes stateless RAX analysis against the immutable epoch image.
+   The analyze/decode fallback, malformed-output rejection and rich effects
+   are retained. Cancellation is checked between instructions. Static analysis
+   remains available when the dynamic backend cannot emulate the image.
+3. The main thread rejects results with changed bytes, item boundaries or modes,
+   then records the same SMIR and decoder facts. Direct-cref application reuses
+   the worker result instead of invoking RAX or walking the function again.
+
+Dynamic-cache hits submit an audit-only job, because IDA decoder state is not
+covered by the emulation cache. Snapshot scope is now the instruction model at
+submission; code newly created by applying results is considered in the next
+epoch. Failed/mismatched generation metadata and cancelled jobs cannot publish
+stale audit results. Thread-initialization failure is reported and does not
+silently move RAX work back onto the UI thread.
+
+Result application and job submission share an 8 ms cooperative timer budget,
+checked between functions. SDK snapshotting, evidence insertion and a single
+function's application may exceed that target. RAX's per-instruction JSON cost
+still exists on workers; this change removes it from the main-thread audit.
+
+**High-impact bounded finding:** the old pending-queue limit excluded completed
+results waiting behind a slow first ticket. The pool now also caps undelivered
+jobs (pending + running + completed) at queue capacity + worker count: 3W with
+the plugin's queue configuration. Thus audit result storage is O(WIE), where I
+is the per-function instruction bound (65,536) and E is bounded per-instruction
+effect storage. This limits retained result count, not total process memory.
+The sample's 11.2 GB peak cannot establish allocation ownership; its cause is
+unknown without heap instrumentation. Each emulator still owns mapped image
+and snapshot state.
+
+Validation: Release plugin build and all 18 CTest cases pass. The production
+worker executor test asserts that instrumented RAX analyze/decode callbacks run
+off the submitting thread, compares serialized effect evidence to direct RAX
+analysis, and covers audit-only jobs, decode fallback, cancellation between
+instructions, and generation mismatch. A blocked-first-ticket regression
+proves backpressure despite an empty pending queue. Worker scheduling tests
+pass ASan/UBSan; changed IDA-free sources also compile under Ubuntu GCC 13.3
+with Release warnings-as-errors. End-to-end latency and peak-memory changes
+on the user's alpha database remain unmeasured; reprofile after loading this
+build to test the claim that the sampled RAX audit stack has left the UI thread.

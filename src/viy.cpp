@@ -1325,8 +1325,6 @@ void viy_t::process_function(size_t index, EmulationJobResult result)
   if ( index >= img.entries.size() )
     return;
   const FuncRange &func = img.entries[index];
-  const uint64_t fstart = func.start;
-  const uint64_t fend = func.end;
 
   // The result is pure worker data. From this point onward execution is back
   // on IDA's main thread and all evidence/database consumers are safe to call.
@@ -1385,17 +1383,17 @@ void viy_t::process_function(size_t index, EmulationJobResult result)
   viy_advanced(img.arch, func, ev, consensus, reached,
                noret_corroborated, cfg, astats);
 
-  // Static decoding and every consumer above execute on this main thread.
+  // Merge the worker audit without invoking the RAX analyzer on the UI thread.
+  // Cancelled or mismatched snapshots must not publish static evidence.
   if ( can_static )
   {
-    const DecoderAuditStats audited = viy_audit_decoders(api, img, func, evidence);
+    viy_discard_stale_decoder_audit(img, result.decoder_audit);
+    const DecoderAuditStats audited = result.status == EmulationJobStatus::CANCELLED
+        ? DecoderAuditStats{}
+        : viy_record_decoder_audit(func, result.decoder_audit, evidence);
     decoder_stats.merge_from(audited);
-    if ( func.chunks.empty() )
-      viy_static_decode_func(api, img.arch, img.big_endian, fstart, fend, cfg, sstats);
-    else
-      for ( const FuncChunk &chunk : func.chunks )
-        viy_static_decode_func(api, img.arch, img.big_endian,
-                               chunk.start, chunk.end, cfg, sstats);
+    if (result.status != EmulationJobStatus::CANCELLED)
+      viy_apply_static_decode(result.decoder_audit, cfg, sstats);
   }
   ++funcs_done;
   ++epoch_funcs_done;
@@ -1455,6 +1453,10 @@ bool viy_t::process_batch(int count)
   }
 
   const size_t budget = size_t(std::max(count, 1));
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
+  const auto time_left = [&] {
+    return inline_mode || std::chrono::steady_clock::now() < deadline;
+  };
   if ( worker_pool != nullptr )
   {
     report_worker_initialization();
@@ -1472,6 +1474,7 @@ bool viy_t::process_batch(int count)
         it = worker_jobs.begin();
         result.runs.clear();
         result.merged = EmuEvents{};
+        result.decoder_audit.clear();
         result.status = EmulationJobStatus::FAILED;
         result.diagnostic = "worker result ticket mismatch";
       }
@@ -1483,6 +1486,7 @@ bool viy_t::process_batch(int count)
       {
         result.runs.clear();
         result.merged = EmuEvents{};
+        result.decoder_audit.clear();
         result.status = EmulationJobStatus::FAILED;
         result.diagnostic = "worker result function mismatch";
       }
@@ -1496,32 +1500,35 @@ bool viy_t::process_batch(int count)
     };
 
     EmulationJobResult ready;
-    while ( applied < budget && worker_pool->try_take_next(ready) )
+    while ( applied < budget && time_left() && worker_pool->try_take_next(ready) )
       apply_one(std::move(ready));
 
     size_t submitted = 0;
-    while ( submitted < budget && next < img.entries.size() )
+    while ( submitted < budget && applied < budget && time_left() && next < img.entries.size() )
     {
+      // Avoid rebuilding an SDK snapshot on every tick while the bounded
+      // worker pipeline is full (including completed, undelivered results).
+      if (worker_jobs.size() >= worker_pool->stats().requested_workers * 3)
+        break;
       EmulationJob job = build_emulation_job(img.entries[next]);
       const uint64_t fingerprint = viy_emulation_job_fingerprint(
           job, img.content_hash, call_summaries);
       const auto cached = dynamic_cache.find(img.entries[next].start);
-      if ( cached != dynamic_cache.end() && cached->second == fingerprint )
+      const bool cache_hit = cached != dynamic_cache.end() && cached->second == fingerprint;
+      if ( cache_hit )
       {
-        EmulationJobResult unchanged;
-        unchanged.function_start = img.entries[next].start;
-        unchanged.status = EmulationJobStatus::UNAVAILABLE;
-        process_function(next, std::move(unchanged));
-        ++dynamic_cache_hits;
-        ++next;
-        ++submitted;
-        ++applied;
-        continue;
+        // The emulation cache does not cover IDA decoder state. Preserve the
+        // static audit on a worker even when no dynamic rerun is necessary.
+        job.runs.clear();
       }
+      if (can_static)
+        job.decoder_inputs = viy_snapshot_decoder_audit(img, job.function);
       uint64_t ticket = 0;
       const size_t requested_runs_count = job.runs.size();
       if ( !worker_pool->try_submit(std::move(job), &ticket) )
         break; // bounded queue backpressure; retry on the next timer tick
+      if (cache_hit)
+        ++dynamic_cache_hits;
       worker_jobs.emplace(ticket,
                           WorkerJobInfo{ next, fingerprint, requested_runs_count });
       ++next;
@@ -1529,7 +1536,7 @@ bool viy_t::process_batch(int count)
     }
 
     // Unavailable executors and short functions can settle during submission.
-    while ( applied < budget && worker_pool->try_take_next(ready) )
+    while ( applied < budget && time_left() && worker_pool->try_take_next(ready) )
       apply_one(std::move(ready));
 
     // Headless/idalib has no timer to wake us. Wait briefly for one ordered

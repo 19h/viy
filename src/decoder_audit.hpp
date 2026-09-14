@@ -8,6 +8,7 @@
 #include "program_model.hpp"
 #include "rax_loader.hpp"
 #include "smir_analysis.hpp"
+#include "decoder_core.hpp"
 
 namespace viy {
 
@@ -28,11 +29,45 @@ struct DecoderAuditStats
   void merge_from(const DecoderAuditStats &other);
 };
 
-// Main-thread only: IDA is queried for item boundaries, decoder results,
-// segment-register state and direct operands.  rax_decode is stateless.
-DecoderAuditStats viy_audit_decoders(const RaxApi *api,
-                                     const ProgramImage &image,
-                                     const FuncRange &function,
-                                     analysis::EvidenceStore &store);
+// Immutable IDA projection captured before submission. No SDK types cross the
+// worker boundary; bytes are read from the generation's shared ProgramImage.
+struct DecoderAuditInput
+{
+  uint64_t address = 0;
+  size_t maximum_bytes = 0;
+  uint32_t mode = 0;
+  bool mode_known = false;
+  bool control_transfer = false;
+  DecoderInstruction ida;
+};
+
+struct DecoderAuditInstruction
+{
+  DecoderAuditInput input;
+  DecoderDecodeResult decoded;
+  bool analyzed = false;
+  SmirInstructionAnalysis effects;
+};
+
+// Main-thread SDK snapshot only. Does not call RAX or write evidence.
+std::vector<DecoderAuditInput> viy_snapshot_decoder_audit(
+    const ProgramImage &image, const FuncRange &function);
+
+// Main-thread revalidation after asynchronous execution: discard inputs whose
+// bytes, instruction boundaries, or ARM/Thumb mode changed during the job.
+void viy_discard_stale_decoder_audit(
+    const ProgramImage &image, std::vector<DecoderAuditInstruction> &instructions);
+
+// IDA-free, stateless worker operation. Preserves the optional analyze/decode
+// fallback and rejects malformed analyze output without silently decoding again.
+DecoderAuditInstruction viy_analyze_decoder_input(
+    const RaxApi *api, const ProgramImage &image, const DecoderAuditInput &input);
+
+// Merge completed worker analysis into the main-thread-owned evidence store.
+// Neither this function nor the snapshot routine invokes RAX.
+DecoderAuditStats viy_record_decoder_audit(
+    const FuncRange &function,
+    const std::vector<DecoderAuditInstruction> &instructions,
+    analysis::EvidenceStore &store);
 
 } // namespace viy

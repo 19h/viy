@@ -379,6 +379,12 @@ bool EmulationWorkerPool::try_submit(EmulationJob job, uint64_t *ticket)
     return false;
   if ( impl_->max_queued_jobs != 0 && impl_->queue.size() >= impl_->max_queued_jobs )
     return false;
+  // Later results are retained until the oldest ticket completes. Bound that
+  // reorder buffer as well as the pending queue, including running jobs.
+  const uint64_t outstanding = impl_->next_ticket - impl_->next_delivery;
+  if ( impl_->max_queued_jobs != 0 && outstanding >= impl_->requested_workers
+    && outstanding - impl_->requested_workers >= impl_->max_queued_jobs )
+    return false;
   if ( impl_->next_ticket == std::numeric_limits<uint64_t>::max() )
     return false;
 

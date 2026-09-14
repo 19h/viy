@@ -232,6 +232,46 @@ void test_generation_cancellation()
   CHECK(third.ticket == fresh && third.status == EmulationJobStatus::COMPLETED);
 }
 
+void test_completed_backpressure()
+{
+  auto gate = std::make_shared<OrderGate>();
+  EmulationWorkerPool pool(2, [gate](size_t)
+  {
+    return std::unique_ptr<EmulationExecutor>(new OrderedExecutor(gate));
+  }, 2);
+  CHECK(pool.wait_for_initialization(2s));
+  CHECK(pool.try_submit(job(1)));
+  // One blocked job, three later completions: queue space alone must not
+  // permit an unlimited reorder buffer behind the first ticket.
+  for (size_t i = 2; i <= 4; ++i)
+  {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!pool.try_submit(job(i)))
+    {
+      CHECK(std::chrono::steady_clock::now() < deadline);
+      std::this_thread::yield();
+    }
+    std::unique_lock<std::mutex> lock(gate->mutex);
+    CHECK(gate->cv.wait_for(lock, 2s, [&] { return gate->later_completed == i - 1; }));
+  }
+  CHECK(!pool.try_submit(job(5)));
+  EmulationJobResult result;
+  CHECK(!pool.try_take_next(result));
+  {
+    std::lock_guard<std::mutex> lock(gate->mutex);
+    gate->release_first = true;
+    gate->cv.notify_all();
+  }
+  CHECK(pool.wait_take_next(result, 2s));
+  CHECK(result.function_start == 1);
+  CHECK(pool.try_submit(job(5)));
+  for (uint64_t i = 2; i <= 5; ++i)
+  {
+    CHECK(pool.wait_take_next(result, 2s));
+    CHECK(result.function_start == i);
+  }
+}
+
 void test_unavailable_and_backpressure()
 {
   EmulationWorkerPool unavailable(2, [](size_t)
@@ -329,6 +369,7 @@ int main()
       fingerprint_job, 10, {{0x5000, EmuSummaryKind::MEMCPY}}));
   test_ordered_delivery();
   test_generation_cancellation();
+  test_completed_backpressure();
   test_unavailable_and_backpressure();
   test_cooperative_shutdown();
   return 0;

@@ -4,8 +4,8 @@
  * This layer has no IDA SDK dependency. It reads bytes only from ProgramImage,
  * negotiates the caller-owned C-ABI effect array, and can translate effects
  * that are genuine static facts into EvidenceStore records. Integration should
- * call viy_analyze_instruction_effects() from the existing decoder-audit walk
- * (where IDA instruction heads/modes are already known), then call
+ * call viy_analyze_instruction_effects() on a worker using snapshotted IDA
+ * instruction heads/modes, then merge results on the owner thread with
  * viy_record_smir_analysis().
  */
 #pragma once

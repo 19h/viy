@@ -213,10 +213,8 @@ DecoderAuditStats viy_audit_decoders(const RaxApi *api,
           ++stats.instructions_compared;
           const size_t wanted = viy_decoder_window_size(
               uint64_t(ea), uint64_t(end), kMaximumBytes);
-          uint8_t bytes[kMaximumBytes] = {};
-          const ssize_t got = wanted == 0 ? 0
-              : get_bytes(bytes, ssize_t(wanted), ea, GMB_READALL);
-          const size_t offered = got > 0 ? size_t(got) : 0;
+          const LoadedByteView bytes = image.loaded_view(uint64_t(ea), wanted);
+          const size_t offered = bytes.size;
           uint32_t mode = 0;
           const bool mode_known = viy_decoder_mode(
               arch, arm_state_at(arch, ea, thumb_reg), mode);
@@ -227,7 +225,7 @@ DecoderAuditStats viy_audit_decoders(const RaxApi *api,
           {
             SmirInstructionAnalysis effects;
             if ( viy_analyze_instruction_effects(
-                    api, image, uint64_t(ea), mode, effects) )
+                    api, image, uint64_t(ea), mode, effects, offered) )
             {
               analyzer_returned = true;
               rax_result = viy_accept_rax_decoded(
@@ -255,7 +253,7 @@ DecoderAuditStats viy_audit_decoders(const RaxApi *api,
           // than masking a cross-capability ABI disagreement with another call.
           if ( !analyzer_returned && offered != 0 && mode_known )
             rax_result = viy_decode_one(api->decode, arch.rax_arch, mode,
-                                        uint64_t(ea), bytes, offered);
+                                        uint64_t(ea), bytes.data, offered);
           if ( rax_result.status != DecoderDecodeStatus::Valid )
           {
             ++stats.rax_decode_failures;

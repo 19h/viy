@@ -43,6 +43,14 @@ enum class ViySegPerm : uint32_t
   READ  = 4u,
 };
 
+// Non-owning initialized bytes from one segment. The image and its segment
+// buffers must outlive the view and remain unchanged while it is used.
+struct LoadedByteView
+{
+  const uint8_t *data = nullptr;
+  size_t size = 0;
+};
+
 // One mapped segment's bytes plus an initialized-byte bitmap (1 bit per byte;
 // bit set => the byte was loaded, i.e. not .bss). Uninitialized bytes are left
 // out of the emulator image and read back as engine zero-fill.
@@ -57,6 +65,8 @@ struct SegImage
 
   bool contains(uint64_t ea) const;
   bool byte_loaded(uint64_t ea) const;
+  // Stops at the first unloaded byte, segment end, or backing-buffer end.
+  LoadedByteView loaded_view(uint64_t ea, size_t maximum_bytes) const;
   bool has_perm(ViySegPerm required) const;
 };
 
@@ -105,6 +115,8 @@ struct ProgramImage
   bool     big_endian = false;
   uint64_t lo = 0;      // min segment start (image lower bound)
   uint64_t hi = 0;      // max segment end   (image upper bound)
+  // Sorted by start, with positive sizes and no overlaps.
+  // Queries and hash traversal rely on this snapshot invariant.
   std::vector<SegImage>  segs;
   std::vector<FuncRange> entries; // functions to emulate
 
@@ -119,6 +131,8 @@ struct ProgramImage
   const SegImage *segment_at(uint64_t ea) const;
   bool contains(uint64_t ea) const { return segment_at(ea) != nullptr; }
   bool byte_loaded(uint64_t ea) const;
+  // Stops at the first unloaded byte, segment end, or backing-buffer end.
+  LoadedByteView loaded_view(uint64_t ea, size_t maximum_bytes) const;
   bool has_perm(uint64_t ea, ViySegPerm required, bool allow_unknown = false) const;
   bool executable(uint64_t ea, bool allow_unknown = false) const
   {

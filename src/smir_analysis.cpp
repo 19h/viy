@@ -152,7 +152,8 @@ bool viy_analyze_instruction_effects(const RaxApi *api,
                                      const ProgramImage &image,
                                      uint64_t instruction,
                                      uint32_t mode_override,
-                                     SmirInstructionAnalysis &out)
+                                     SmirInstructionAnalysis &out,
+                                     size_t maximum_bytes)
 {
   SmirInstructionAnalysis candidate;
   if ( api == nullptr || api->analyze == nullptr )
@@ -163,22 +164,9 @@ bool viy_analyze_instruction_effects(const RaxApi *api,
     candidate.mode = mode_override;
   candidate.instruction = instruction;
 
-  const SegImage *segment = image.segment_at(instruction);
-  if ( segment == nullptr || instruction >= segment->end )
-    return false;
-  const uint64_t available64 = std::min<uint64_t>(
-      kMaximumInstructionBytes, segment->end - instruction);
-  const size_t available = size_t(available64);
-  std::vector<uint8_t> bytes;
-  bytes.reserve(available);
-  for ( size_t i = 0; i < available; ++i )
-  {
-    const uint64_t ea = instruction + uint64_t(i);
-    if ( !segment->byte_loaded(ea) )
-      break;
-    bytes.push_back(segment->bytes[size_t(ea - segment->start)]);
-  }
-  if ( bytes.empty() )
+  const LoadedByteView bytes = image.loaded_view(
+      instruction, std::min(kMaximumInstructionBytes, maximum_bytes));
+  if ( bytes.size == 0 )
     return false;
 
   // Most instructions have fewer than ten effects. Start with a bounded
@@ -190,7 +178,7 @@ bool viy_analyze_instruction_effects(const RaxApi *api,
   size_t required = 0;
   rax_analysis summary{};
   rax_status status = api->analyze(
-      candidate.arch, candidate.mode, instruction, bytes.data(), bytes.size(),
+      candidate.arch, candidate.mode, instruction, bytes.data, bytes.size,
       &summary, candidate.effects.data(), candidate.effects.size(), &required);
   if ( required > kMaximumEffects
     || summary.struct_size != sizeof(rax_analysis)
@@ -207,7 +195,7 @@ bool viy_analyze_instruction_effects(const RaxApi *api,
     candidate.effects.resize(required);
     size_t retry_required = 0;
     status = api->analyze(candidate.arch, candidate.mode, instruction,
-                          bytes.data(), bytes.size(), &summary,
+                          bytes.data, bytes.size, &summary,
                           candidate.effects.data(), candidate.effects.size(),
                           &retry_required);
     if ( retry_required != required

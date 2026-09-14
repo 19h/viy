@@ -8,6 +8,7 @@
 #include "program_model.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <iterator>
 #include <limits>
 
@@ -30,6 +31,36 @@ bool SegImage::has_perm(ViySegPerm required) const
 {
   const uint32_t bits = static_cast<uint32_t>(required);
   return (perm & bits) == bits;
+}
+
+LoadedByteView SegImage::loaded_view(uint64_t ea, size_t maximum_bytes) const
+{
+  if ( !contains(ea) || maximum_bytes == 0 )
+    return {};
+  const uint64_t offset = ea - start;
+  if ( offset >= bytes.size() )
+    return {};
+  const size_t begin = static_cast<size_t>(offset);
+  const size_t limit = static_cast<size_t>(std::min<uint64_t>(
+      end - ea, std::min(maximum_bytes, bytes.size() - begin)));
+  size_t length = 0;
+  while ( length < limit )
+  {
+    const size_t current = begin + length;
+    if ( current / 8 >= mask.size() )
+      break;
+    const size_t count = std::min(size_t(8) - (current & 7), limit - length);
+    const unsigned bits = unsigned(mask[current / 8]) >> (current & 7);
+    const unsigned required = (1u << count) - 1;
+    if ( (bits & required) != required )
+    {
+      for ( size_t i = 0; i < count && (bits & (1u << i)) != 0; ++i )
+        ++length;
+      break;
+    }
+    length += count;
+  }
+  return length == 0 ? LoadedByteView{} : LoadedByteView{ bytes.data() + begin, length };
 }
 
 bool FuncRange::contains(uint64_t ea) const
@@ -83,6 +114,12 @@ bool ProgramImage::byte_loaded(uint64_t ea) const
   return seg != nullptr && seg->byte_loaded(ea);
 }
 
+LoadedByteView ProgramImage::loaded_view(uint64_t ea, size_t maximum_bytes) const
+{
+  const SegImage *segment = segment_at(ea);
+  return segment == nullptr ? LoadedByteView{} : segment->loaded_view(ea, maximum_bytes);
+}
+
 bool ProgramImage::has_perm(uint64_t ea, ViySegPerm required, bool allow_unknown) const
 {
   const SegImage *seg = segment_at(ea);
@@ -124,6 +161,56 @@ void hash_byte(uint64_t &hash, uint8_t value)
   hash *= kFnvPrime;
 }
 
+constexpr uint64_t zero_byte_multiplier(unsigned count)
+{
+  uint64_t multiplier = 1;
+  for ( unsigned i = 0; i < count; ++i )
+    multiplier *= kFnvPrime;
+  return multiplier;
+}
+
+void hash_bytes(uint64_t &hash, const std::vector<uint8_t> &bytes)
+{
+  // Zero-filled data (including snapshot BSS) still participates in the exact
+  // identity. A run of N zero bytes multiplies the hash by P^N modulo 2^64.
+  // Scan zero words without the serial hash dependency, then apply the factor
+  // with exponentiation by squaring. memcpy is alignment/endian independent.
+  size_t offset = 0;
+  while ( bytes.size() - offset >= sizeof(uint64_t) )
+  {
+    uint64_t word;
+    std::memcpy(&word, bytes.data() + offset, sizeof(word));
+    if ( word == 0 )
+    {
+      const size_t begin = offset;
+      do
+      {
+        offset += sizeof(word);
+        if ( bytes.size() - offset < sizeof(word) )
+          break;
+        std::memcpy(&word, bytes.data() + offset, sizeof(word));
+      } while ( word == 0 );
+      size_t words = (offset - begin) / sizeof(word);
+      uint64_t multiplier = zero_byte_multiplier(sizeof(word));
+      while ( words != 0 )
+      {
+        if ( (words & 1) != 0 )
+          hash *= multiplier;
+        multiplier *= multiplier;
+        words >>= 1;
+      }
+    }
+    else
+    {
+      for ( size_t i = 0; i < sizeof(word); ++i )
+        hash_byte(hash, bytes[offset + i]);
+      offset += sizeof(word);
+    }
+  }
+  for ( ; offset < bytes.size(); ++offset )
+    hash_byte(hash, bytes[offset]);
+}
+
 void hash_u64(uint64_t &hash, uint64_t value)
 {
   // Fixed byte order makes the result host-independent.
@@ -138,29 +225,33 @@ void hash_chunk_bytes(uint64_t &hash, const ProgramImage &img,
   hash_u64(hash, chunk.size());
 
   uint64_t ea = chunk.start;
+  // Locate the first possible containing segment once, then advance through
+  // the sorted, non-overlapping snapshot. Restarting a scan at each hole made
+  // fragmented chunks quadratic in the number of segments.
+  auto segment = std::upper_bound(img.segs.begin(), img.segs.end(), ea,
+                                 [](uint64_t value, const SegImage &candidate)
+                                 { return value < candidate.start; });
+  if ( segment != img.segs.begin() )
+    --segment;
   while ( ea < chunk.end )
   {
-    const SegImage *seg = img.segment_at(ea);
-    if ( seg == nullptr )
+    while ( segment != img.segs.end() && segment->end <= ea )
+      ++segment;
+    if ( segment == img.segs.end() || !segment->contains(ea) )
     {
       // Function chunks should normally be mapped. Encode an unmapped run as a
       // distinct marker+length rather than hashing a potentially huge hole byte
       // by byte.
       uint64_t next = chunk.end;
-      for ( const SegImage &candidate : img.segs )
-      {
-        if ( candidate.start > ea )
-        {
-          next = std::min(next, candidate.start);
-          break;
-        }
-      }
+      if ( segment != img.segs.end() )
+        next = std::min(next, segment->start);
       hash_byte(hash, 0); // unmapped-run marker
       hash_u64(hash, next - ea);
       ea = next;
       continue;
     }
 
+    const SegImage *seg = &*segment;
     const uint64_t run_end = std::min(chunk.end, seg->end);
     const uint64_t off = ea - seg->start;
     for ( uint64_t i = 0, count = run_end - ea; i < count; ++i )
@@ -213,10 +304,8 @@ uint64_t viy_program_content_hash(const ProgramImage &img)
     hash_byte(hash, segment.bitness);
     hash_u64(hash, uint64_t(segment.bytes.size()));
     hash_u64(hash, uint64_t(segment.mask.size()));
-    for ( uint8_t byte : segment.mask )
-      hash_byte(hash, byte);
-    for ( uint8_t byte : segment.bytes )
-      hash_byte(hash, byte);
+    hash_bytes(hash, segment.mask);
+    hash_bytes(hash, segment.bytes);
   }
   return hash;
 }

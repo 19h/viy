@@ -17,6 +17,7 @@
 #include "emu_driver.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -51,6 +52,18 @@ bool contains_range(uint64_t lo, uint64_t hi, uint64_t address, uint64_t size)
 // The stable context handed to every hook via the rax `user` pointer.
 struct HookCtx
 {
+  // Classification already uses immutable snapshot bytes, not guest writes.
+  // Keep a bounded, per-run direct-mapped cache, including failed decodes.
+  // Exact PC tags make collisions misses; architecture/mode are fixed per run.
+  struct DecodeEntry
+  {
+    uint64_t pc = 0;
+    uint32_t size = 0;
+    ExecEdge::Kind kind = ExecEdge::Kind::Unknown;
+    bool occupied = false;
+    bool valid = false;
+  };
+  std::array<DecodeEntry, 1024> decode_cache{};
   EmuEvents *out = nullptr;
   const RaxApi *api = nullptr;
   const std::vector<int> *capture_regs = nullptr;
@@ -475,7 +488,7 @@ bool apply_summary(HookCtx *c, rax_engine *engine, const EmuCallSummary &summary
   return true;
 }
 
-bool decode_at(const HookCtx *c, uint64_t pc, uint32_t *size,
+bool decode_at(HookCtx *c, uint64_t pc, uint32_t *size,
                ExecEdge::Kind *kind)
 {
   if ( size != nullptr )
@@ -484,49 +497,43 @@ bool decode_at(const HookCtx *c, uint64_t pc, uint32_t *size,
     *kind = ExecEdge::Kind::Unknown;
   if ( c->api == nullptr || c->api->decode == nullptr || c->image == nullptr )
     return false;
-  for ( const SegImage &segment : c->image->segs )
+  auto &cached = c->decode_cache[(pc ^ (pc >> 10)) % c->decode_cache.size()];
+  if ( cached.occupied && cached.pc == pc )
   {
-    if ( pc < segment.start || pc >= segment.end )
-      continue;
-    const uint64_t raw_offset = pc - segment.start;
-    if ( raw_offset >= segment.bytes.size() )
-      return false;
-    const size_t offset = size_t(raw_offset);
-    const size_t available = std::min<size_t>(15, segment.bytes.size() - offset);
-    size_t loaded = 0;
-    while ( loaded < available )
-    {
-      const size_t bit = offset + loaded;
-      if ( bit / 8 >= segment.mask.size()
-        || (segment.mask[bit / 8] & uint8_t(1u << (bit & 7))) == 0 )
-        break;
-      ++loaded;
-    }
-    if ( loaded == 0 )
-      return false;
-    rax_decoded decoded{};
-    if ( c->api->decode(c->rax_arch, c->rax_mode, pc,
-                        segment.bytes.data() + offset, loaded, &decoded) != RAX_OK
-      || decoded.valid == 0 || decoded.size == 0 )
-      return false;
     if ( size != nullptr )
-      *size = decoded.size;
+      *size = cached.size;
     if ( kind != nullptr )
-    {
-      switch ( decoded.flow )
-      {
-        case RAX_FLOW_CALL:
-        case RAX_FLOW_INDIRECT_CALL: *kind = ExecEdge::Kind::Call; break;
-        case RAX_FLOW_BRANCH:
-        case RAX_FLOW_COND_BRANCH:
-        case RAX_FLOW_INDIRECT_JUMP: *kind = ExecEdge::Kind::Jump; break;
-        case RAX_FLOW_RETURN: *kind = ExecEdge::Kind::Return; break;
-        default: break;
-      }
-    }
-    return true;
+      *kind = cached.kind;
+    return cached.valid;
   }
-  return false;
+  cached = HookCtx::DecodeEntry{};
+  cached.pc = pc;
+  cached.occupied = true;
+  const LoadedByteView bytes = c->image->loaded_view(pc, 15);
+  if ( bytes.size == 0 )
+    return false;
+  rax_decoded decoded{};
+  if ( c->api->decode(c->rax_arch, c->rax_mode, pc,
+                      bytes.data, bytes.size, &decoded) != RAX_OK
+    || decoded.valid == 0 || decoded.size == 0 )
+    return false;
+  cached.valid = true;
+  cached.size = decoded.size;
+  switch ( decoded.flow )
+  {
+    case RAX_FLOW_CALL:
+    case RAX_FLOW_INDIRECT_CALL: cached.kind = ExecEdge::Kind::Call; break;
+    case RAX_FLOW_BRANCH:
+    case RAX_FLOW_COND_BRANCH:
+    case RAX_FLOW_INDIRECT_JUMP: cached.kind = ExecEdge::Kind::Jump; break;
+    case RAX_FLOW_RETURN: cached.kind = ExecEdge::Kind::Return; break;
+    default: break;
+  }
+  if ( size != nullptr )
+    *size = cached.size;
+  if ( kind != nullptr )
+    *kind = cached.kind;
+  return true;
 }
 
 void code_tr(rax_engine *engine, uint64_t addr, uint32_t size, void *user)
@@ -540,11 +547,14 @@ void code_tr(rax_engine *engine, uint64_t addr, uint32_t size, void *user)
     return;
   }
   const uint64_t event_sequence = c->sequence++;
-  if ( c->has_prev )
+  if ( c->has_prev && addr >= c->lo && addr < c->hi
+    && hook_in_function(c, c->prev_pc)
+    && c->out->edges.size() < c->edge_cap )
   {
     uint32_t decoded_size = 0;
     ExecEdge::Kind edge_kind = ExecEdge::Kind::Unknown;
-    decode_at(c, c->prev_pc, &decoded_size, &edge_kind);
+    if ( c->prev_size == 0 )
+      decode_at(c, c->prev_pc, &decoded_size, &edge_kind);
     const uint64_t instruction_size = c->prev_size != 0 ? c->prev_size : decoded_size;
     uint64_t fallthrough = 0;
     const bool fallthrough_valid = instruction_size != 0
@@ -558,6 +568,8 @@ void code_tr(rax_engine *engine, uint64_t addr, uint32_t size, void *user)
       && hook_in_function(c, c->prev_pc)
       && c->out->edges.size() < c->edge_cap )
     {
+      if ( c->prev_size != 0 )
+        decode_at(c, c->prev_pc, nullptr, &edge_kind);
       c->out->edges.push_back(ExecEdge{ c->prev_pc, addr, c->run_id,
                                         c->seed, edge_kind, event_sequence });
       if ( c->api != nullptr && c->capture_regs != nullptr

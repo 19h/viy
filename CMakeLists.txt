@@ -266,6 +266,18 @@ if(BUILD_TESTING)
   target_link_libraries(viy_emu_evidence_tests PRIVATE rax::rax_static)
   viy_harden_test_target(viy_emu_evidence_tests)
 
+  add_executable(viy_emu_decode_perf_tests
+    tests/emu_decode_perf_test.cpp
+    src/abi_policy.cpp
+    src/emu_driver.cpp
+    src/program_model_core.cpp
+    src/rax_loader.cpp)
+  target_include_directories(viy_emu_decode_perf_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src" "${RAX_CAPI_DIR}/include")
+  target_compile_features(viy_emu_decode_perf_tests PRIVATE cxx_std_17)
+  target_link_libraries(viy_emu_decode_perf_tests PRIVATE rax::rax_static)
+  viy_harden_test_target(viy_emu_decode_perf_tests)
+
   add_executable(viy_abi_policy_tests
     tests/abi_policy_test.cpp
     src/abi_policy.cpp
@@ -283,6 +295,14 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
   target_compile_features(viy_program_model_tests PRIVATE cxx_std_17)
   viy_harden_test_target(viy_program_model_tests)
+
+  add_executable(viy_program_model_perf_tests
+    tests/program_model_perf_test.cpp
+    src/program_model_core.cpp)
+  target_include_directories(viy_program_model_perf_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_features(viy_program_model_perf_tests PRIVATE cxx_std_17)
+  viy_harden_test_target(viy_program_model_perf_tests)
 
   add_executable(viy_hexrays_bridge_tests
     tests/hexrays_bridge_test.cpp
@@ -341,6 +361,14 @@ if(BUILD_TESTING)
   viy_harden_test_target(viy_runtime_enrich_core_tests)
 
   if(VIY_TEST_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(viy_emu_decode_perf_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(viy_emu_decode_perf_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_compile_options(viy_program_model_perf_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_options(viy_program_model_perf_tests PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_compile_options(viy_evidence_tests PRIVATE
       -fsanitize=address,undefined -fno-omit-frame-pointer)
     target_link_options(viy_evidence_tests PRIVATE
@@ -405,8 +433,10 @@ if(BUILD_TESTING)
   add_test(NAME viy.diagnostics COMMAND viy_diagnostics_tests)
   add_test(NAME viy.emulation_workers COMMAND viy_emulation_worker_tests)
   add_test(NAME viy.emu_evidence COMMAND viy_emu_evidence_tests)
+  add_test(NAME viy.emu_decode_perf COMMAND viy_emu_decode_perf_tests)
   add_test(NAME viy.abi_policy COMMAND viy_abi_policy_tests)
   add_test(NAME viy.program_model COMMAND viy_program_model_tests)
+  add_test(NAME viy.program_model_perf COMMAND viy_program_model_perf_tests)
   add_test(NAME viy.hexrays_bridge COMMAND viy_hexrays_bridge_tests)
   add_test(NAME viy.smir_analysis COMMAND viy_smir_analysis_tests)
   add_test(NAME viy.decoder_core COMMAND viy_decoder_core_tests)

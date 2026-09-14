@@ -23,6 +23,21 @@ namespace {
 using namespace analysis;
 
 decltype(&rax_analyze) g_real_analyze = nullptr;
+const void *g_expected_bytes = nullptr;
+size_t g_expected_length = 0;
+size_t g_view_calls = 0;
+
+rax_status inspect_view(int arch, uint32_t mode, uint64_t pc,
+                        const void *bytes, size_t length,
+                        rax_analysis *summary, rax_analysis_effect *effects,
+                        size_t capacity, size_t *required)
+{
+  CHECK(bytes == g_expected_bytes);
+  CHECK(length == g_expected_length);
+  ++g_view_calls;
+  return g_real_analyze(arch, mode, pc, bytes, length, summary,
+                        effects, capacity, required);
+}
 
 rax_status truncating_analyze(int arch, uint32_t mode, uint64_t pc,
                               const void *bytes, size_t length,
@@ -104,6 +119,29 @@ int main()
   const RaxApi *api = rax_load();
   require_real_rax(api);
   CHECK(api != nullptr && api->analyze != nullptr);
+
+  // The analyzer must borrow the snapshot's storage and respect caller bounds,
+  // backing-buffer ends, and initialized-byte holes before entering the ABI.
+  {
+    ProgramImage bounded = image_with_code(ViyArch::X86_64);
+    auto &segment = bounded.segs.front();
+    RaxApi observed = *api;
+    g_real_analyze = api->analyze;
+    observed.analyze = inspect_view;
+    g_expected_bytes = segment.bytes.data();
+    g_expected_length = 1;
+    SmirInstructionAnalysis output;
+    CHECK(viy_analyze_instruction_effects(&observed, bounded, 0x1000, 0, output, 1));
+    segment.mask[0] = 1;
+    CHECK(viy_analyze_instruction_effects(&observed, bounded, 0x1000, 0, output));
+    segment.mask[0] = 255;
+    segment.bytes.resize(1);
+    CHECK(viy_analyze_instruction_effects(&observed, bounded, 0x1000, 0, output));
+    CHECK(g_view_calls == 3);
+    CHECK(!viy_analyze_instruction_effects(&observed, bounded, 0x1000, 0, output, 0));
+    CHECK(!viy_analyze_instruction_effects(&observed, bounded, 0x1001, 0, output));
+    CHECK(g_view_calls == 3);
+  }
 
   ProgramImage image = image_with_code(ViyArch::X86_64);
   put(image, 0x1000, { 0x48, 0xc7, 0xc0, 0x34, 0x12, 0x00, 0x00 });

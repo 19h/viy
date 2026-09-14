@@ -44,6 +44,7 @@ struct SmirAnalysisStats
 
 // Analyze one address from the immutable image. `mode_override` is used when
 // nonzero; otherwise the mode is derived conservatively from ProgramImage.
+// `maximum_bytes` also bounds decoding at the caller's function/chunk boundary.
 // Returns false for absent capability, unmapped/unloaded bytes, bad ABI output,
 // or a hard rax error. Unsupported-but-valid decode is a successful result with
 // RAX_ANALYSIS_UNSUPPORTED in out.summary.flags.
@@ -51,7 +52,8 @@ bool viy_analyze_instruction_effects(const RaxApi *api,
                                      const ProgramImage &image,
                                      uint64_t instruction,
                                      uint32_t mode_override,
-                                     SmirInstructionAnalysis &out);
+                                     SmirInstructionAnalysis &out,
+                                     size_t maximum_bytes = 16);
 
 // Store only facts the stateless lift proves directly: encoded control targets,
 // resolved absolute memory accesses, and <=64-bit constant register results.

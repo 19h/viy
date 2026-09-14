@@ -194,6 +194,7 @@ void canonicalize_conflict_digests(EvidenceConflict &conflict)
 
 struct ConflictAccumulator
 {
+  bool contradictions_only = false;
   std::vector<EvidenceConflict> conflicts;
   std::unordered_map<const FactPayload *, FactDigest> digests;
 
@@ -219,6 +220,8 @@ void add_conflict(ConflictAccumulator &out,
                   std::optional<Address> secondary,
                   std::string explanation)
 {
+  if (out.contradictions_only && severity != ConflictSeverity::Contradiction)
+    return;
   EvidenceConflict conflict;
   conflict.type = type;
   conflict.severity = severity;
@@ -728,11 +731,67 @@ bool conflict_less(const EvidenceConflict &lhs, const EvidenceConflict &rhs)
                   rhs.left, rhs.right, rhs.explanation);
 }
 
+struct EvidenceStore::ContradictionIndex
+{
+  using Subject = std::tuple<uint8_t, Address, Address>;
+  struct Entry
+  {
+    const std::vector<uint8_t> *key;
+    const EvidenceRecord *record;
+  };
+  std::map<Subject, std::vector<Entry>> subjects;
+  std::multimap<Address, Entry> regions;
+  Address maximum_region_size = 0;
+
+  static std::optional<Subject> subject(const FactPayload &payload)
+  {
+    if (const auto *fact = std::get_if<CodeTargetFact>(&payload))
+      return Subject{1, fact->from, static_cast<Address>(fact->kind)};
+    if (const auto *fact = std::get_if<BranchReachabilityFact>(&payload))
+      return Subject{2, fact->branch, fact->successor};
+    if (const auto *fact = std::get_if<CfgCandidateFact>(&payload))
+      return Subject{2, fact->from, fact->to};
+    if (const auto *fact = std::get_if<FunctionTraitFact>(&payload))
+    {
+      if (is_return_trait(fact->trait))
+        return Subject{3, fact->function, 0};
+    }
+    if (const auto *fact = std::get_if<FunctionOutcomeFact>(&payload))
+    {
+      if (fact->stop == FunctionStopKind::Returned)
+        return Subject{3, fact->function, 0};
+    }
+    if (const auto *fact = std::get_if<DispatchMapFact>(&payload))
+      return Subject{4, fact->site, 0};
+    return std::nullopt;
+  }
+
+  void insert(const std::vector<uint8_t> &key, const EvidenceRecord &record)
+  {
+    const Entry entry{&key, &record};
+    if (const auto grouped = subject(record.payload))
+      subjects[*grouped].push_back(entry);
+    else if (const auto *region = std::get_if<CodeRegionFact>(&record.payload))
+    {
+      regions.emplace(region->start, entry);
+      maximum_region_size = std::max(maximum_region_size, region->end - region->start);
+    }
+  }
+};
+
 EvidenceStore::EvidenceStore() = default;
 EvidenceStore::~EvidenceStore() = default;
-EvidenceStore::EvidenceStore(const EvidenceStore &other) = default;
+EvidenceStore::EvidenceStore(const EvidenceStore &other) : records_(other.records_) {}
 EvidenceStore::EvidenceStore(EvidenceStore &&other) noexcept = default;
-EvidenceStore &EvidenceStore::operator=(const EvidenceStore &other) = default;
+EvidenceStore &EvidenceStore::operator=(const EvidenceStore &other)
+{
+  if (this != &other)
+  {
+    EvidenceStore copy(other);
+    *this = std::move(copy);
+  }
+  return *this;
+}
 EvidenceStore &EvidenceStore::operator=(EvidenceStore &&other) noexcept = default;
 
 AddResult EvidenceStore::add(AnalysisFact fact)
@@ -745,12 +804,12 @@ AddResult EvidenceStore::add(AnalysisFact fact)
   }
 
   std::vector<uint8_t> key;
-  if (!encode_payload(fact.payload, key, &result.error) ||
-      !stable_digest(fact.payload, result.payload_digest, &result.error))
+  if (!encode_payload(fact.payload, key, &result.error))
   {
     result.disposition = AddDisposition::RejectedInvalid;
     return result;
   }
+  result.payload_digest = sha256_bytes(key);
 
   auto record_it = records_.find(key);
   if (record_it == records_.end())
@@ -758,7 +817,9 @@ AddResult EvidenceStore::add(AnalysisFact fact)
     EvidenceRecord record;
     record.payload = std::move(fact.payload);
     record.observations.push_back(std::move(fact.evidence));
-    records_.emplace(std::move(key), std::move(record));
+    const auto inserted = records_.emplace(std::move(key), std::move(record));
+    if (contradiction_index_)
+      contradiction_index_->insert(inserted.first->first, inserted.first->second);
     result.disposition = AddDisposition::InsertedRecord;
     return result;
   }
@@ -809,6 +870,7 @@ MergeReport EvidenceStore::merge(const EvidenceStore &other, bool count_conflict
 
 void EvidenceStore::clear()
 {
+  contradiction_index_.reset();
   records_.clear();
 }
 
@@ -899,6 +961,84 @@ const EvidenceRecord *EvidenceStore::find(const FactPayload &payload) const
     return nullptr;
   const auto found = records_.find(key);
   return found == records_.end() ? nullptr : &found->second;
+}
+
+std::optional<EvidenceConflict> EvidenceStore::new_contradiction(
+    const FactPayload &payload, uint64_t generation,
+    ContradictionScanStats *stats_out) const
+{
+  ContradictionScanStats local_stats;
+  ContradictionScanStats &stats = stats_out ? *stats_out : local_stats;
+  stats = {};
+  const auto grouped = ContradictionIndex::subject(payload);
+  const auto *region = std::get_if<CodeRegionFact>(&payload);
+  if (!grouped && !region)
+    return std::nullopt;
+
+  const auto active = [generation](const EvidenceRecord &record)
+  {
+    return std::any_of(record.observations.begin(), record.observations.end(),
+                      [generation](const Evidence &observation)
+    {
+      return generation == 0 || observation.scope.generation == generation
+          || observation.proof == ProofKind::UserAsserted;
+    });
+  };
+  std::vector<uint8_t> key;
+  if (!encode_payload(payload, key, nullptr))
+    return std::nullopt; // Caller validates the complete fact before querying.
+  const auto existing = records_.find(key);
+  if (existing != records_.end() && active(existing->second))
+    return std::nullopt;
+
+  if (!contradiction_index_)
+  {
+    auto index = std::make_unique<ContradictionIndex>();
+    for (const auto &entry : records_)
+      index->insert(entry.first, entry.second);
+    stats.records_indexed = records_.size();
+    contradiction_index_ = std::move(index);
+  }
+  ConflictAccumulator accumulator;
+  accumulator.contradictions_only = true;
+  const auto compare = [&](const ContradictionIndex::Entry &entry)
+  {
+    ++stats.candidate_relations_examined;
+    if (!active(*entry.record))
+      return;
+    // Preserve canonical ledger pair order, including directional diagnostic
+    // text for branch/CFG pairs. Digests are computed only on actual conflicts.
+    if (key < *entry.key)
+      compare_payloads(payload, entry.record->payload, accumulator);
+    else
+      compare_payloads(entry.record->payload, payload, accumulator);
+  };
+  if (grouped)
+  {
+    const auto bucket = contradiction_index_->subjects.find(*grouped);
+    if (bucket != contradiction_index_->subjects.end())
+      for (const auto &entry : bucket->second)
+        compare(entry);
+  }
+  else
+  {
+    // A region starting earlier than start - maximum_size cannot overlap.
+    // Saturating subtraction covers regions at zero and near UINT64_MAX.
+    const Address span = contradiction_index_->maximum_region_size;
+    const Address lower = region->start > span ? region->start - span : 0;
+    auto it = contradiction_index_->regions.lower_bound(lower);
+    for (; it != contradiction_index_->regions.end() && it->first < region->end; ++it)
+    {
+      const auto &other = std::get<CodeRegionFact>(it->second.record->payload);
+      if (other.end > region->start && region_kinds_incompatible(region->kind, other.kind))
+        compare(it->second);
+    }
+  }
+  stats.payload_digests_computed = accumulator.digests.size();
+  if (accumulator.conflicts.empty())
+    return std::nullopt;
+  return *std::min_element(accumulator.conflicts.begin(), accumulator.conflicts.end(),
+                           conflict_less);
 }
 
 std::vector<EvidenceConflict> EvidenceStore::detect_conflicts() const

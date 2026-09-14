@@ -116,6 +116,11 @@ struct viy_t : public plugmod_t
   std::unique_ptr<DeobfEvidenceStoreSink> deobf_store_sink;
   std::unique_ptr<DeobfAnalysisProvider> deobf_provider;
   DeobfAnalysisStats deobf_stats;
+  DeobfAnalysisStats deobf_epoch_stats;
+  std::vector<uint64_t> deobf_functions;
+  size_t deobf_next = 0;
+  uint64_t deobf_started_ms = 0;
+  bool deobf_pending = false;
   RuntimeEnrichStats rstats;
   EvidenceBridgeStats bridge_stats;
   EvidenceApplyStats evidence_stats;
@@ -154,6 +159,7 @@ struct viy_t : public plugmod_t
 
   void on_analysis_done();
   bool begin_epoch();
+  void process_deobf_batch();
   void initialize_generation_allocator();
   uint64_t allocate_generation();
   void assign_function_generations();
@@ -963,6 +969,10 @@ bool viy_t::begin_epoch()
   next = 0;
   worker_jobs.clear();
   waiting_for_auto = false;
+  deobf_pending = false;
+  deobf_functions.clear();
+  deobf_next = 0;
+  deobf_epoch_stats = {};
 
   set_diagnostic_phase(ViyDiagnosticPhase::SNAPSHOTTING);
   const uint64_t snapshot_started_ms = diagnostic_elapsed_ms();
@@ -1157,46 +1167,89 @@ bool viy_t::begin_epoch()
 
   if ( can_deobf && deobf_provider != nullptr )
   {
-    set_diagnostic_phase(ViyDiagnosticPhase::DEOBFUSCATION_ANALYSIS);
-    const uint64_t provider_started_ms = diagnostic_elapsed_ms();
     deobf_provider->reset();
     deobf_provider->set_epoch(provider_generation);
     deobf_store_sink->set_active_generation(provider_generation);
     deobf_store_sink->reset_report();
-    DeobfAnalysisOptions options;
-    options.max_functions = cfg.max_funcs == 0 ? 0 : size_t(cfg.max_funcs);
-    options.progress = [this](const DeobfAnalysisProgress &progress)
-    {
-      log_deobf_progress(progress);
-    };
-    const DeobfAnalysisStats ds = deobf_provider->analyze_database(options);
-    merge_deobf_stats(deobf_stats, ds);
-    const DeobfEvidenceStoreReport &report = deobf_store_sink->report();
-    log_event(ViyLogLevel::SUMMARY,
-              "event=provider provider=deobfuscation epoch="
-            + std::to_string(epoch + 1)
-            + " functions=" + std::to_string(ds.functions_scanned)
-            + " blocks=" + std::to_string(ds.blocks_scanned)
-            + " instructions=" + std::to_string(ds.instructions_scanned)
-            + " decode_failures=" + std::to_string(ds.decode_failures)
-            + " facts_emitted=" + std::to_string(ds.facts_emitted)
-            + " facts_inserted=" + std::to_string(report.inserted_records)
-            + " observations_added=" + std::to_string(report.added_observations)
-            + " duplicates=" + std::to_string(report.duplicate_observations)
-            + " rejected=" + std::to_string(report.rejected_invalid)
-            + " contradictions=" + std::to_string(report.contradictions_suppressed)
-            + " budget_truncations=" + std::to_string(ds.budget_truncations)
-            + " duration_ms=" + std::to_string(
-                  diagnostic_elapsed_ms() - provider_started_ms));
-    if ( deobf_store_sink->last_error()[0] != '\0' )
-      log_event(ViyLogLevel::SUMMARY,
-                "event=diagnostic scope=deobfuscation message=\""
-              + viy_sanitize_diagnostic(deobf_store_sink->last_error()) + "\"");
+    const size_t count = get_func_qty();
+    const size_t limit = cfg.max_funcs == 0 ? count : std::min(count, size_t(cfg.max_funcs));
+    deobf_functions.reserve(limit);
+    for (size_t i = 0; i < limit; ++i)
+      if (const func_t *function = getn_func(i))
+        deobf_functions.push_back(uint64_t(function->start_ea));
+    deobf_pending = true;
+    deobf_started_ms = diagnostic_elapsed_ms();
   }
 
   epoch_change_base = change_count();
-  set_diagnostic_phase(ViyDiagnosticPhase::SWEEPING_FUNCTIONS);
+  set_diagnostic_phase(deobf_pending ? ViyDiagnosticPhase::DEOBFUSCATION_ANALYSIS
+                                     : ViyDiagnosticPhase::SWEEPING_FUNCTIONS);
   return true;
+}
+
+//-----------------------------------------------------------------------------
+void viy_t::process_deobf_batch()
+{
+  // SDK reads stay on the main thread. Bound each timer callback by both a
+  // function count and elapsed time, yielding only between whole functions.
+  // A single function can exceed 8 ms; its instruction/block caps still apply.
+  constexpr size_t maximum_functions = 64;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
+  const DeobfAnalysisOptions options;
+  for (size_t processed = 0;
+       processed < maximum_functions && deobf_next < deobf_functions.size(); ++processed)
+  {
+    const uint64_t start = deobf_functions[deobf_next++];
+    const func_t *function = get_func(ea_t(start));
+    if (function != nullptr && uint64_t(function->start_ea) == start)
+    {
+      const auto result = deobf_provider->analyze_function(start, options);
+      merge_deobf_stats(deobf_epoch_stats, result);
+      merge_deobf_stats(deobf_stats, result);
+    }
+    if (std::chrono::steady_clock::now() >= deadline)
+      break;
+  }
+  DeobfAnalysisProgress progress;
+  progress.functions_completed = deobf_next;
+  progress.functions_total = deobf_functions.size();
+  progress.instructions_scanned = deobf_epoch_stats.instructions_scanned;
+  progress.blocks_scanned = deobf_epoch_stats.blocks_scanned;
+  progress.facts_emitted = deobf_epoch_stats.facts_emitted;
+  if (deobf_next == deobf_functions.size())
+  {
+    progress.stage = DeobfAnalysisProgressStage::COMPLETE;
+    progress.stage_boundary = true;
+  }
+  log_deobf_progress(progress);
+  if (deobf_next != deobf_functions.size())
+    return;
+
+  const DeobfAnalysisStats &ds = deobf_epoch_stats;
+  const DeobfEvidenceStoreReport &report = deobf_store_sink->report();
+  log_event(ViyLogLevel::SUMMARY,
+            "event=provider provider=deobfuscation epoch="
+          + std::to_string(epoch + 1)
+          + " functions=" + std::to_string(ds.functions_scanned)
+          + " blocks=" + std::to_string(ds.blocks_scanned)
+          + " instructions=" + std::to_string(ds.instructions_scanned)
+          + " decode_failures=" + std::to_string(ds.decode_failures)
+          + " facts_emitted=" + std::to_string(ds.facts_emitted)
+          + " facts_inserted=" + std::to_string(report.inserted_records)
+          + " observations_added=" + std::to_string(report.added_observations)
+          + " duplicates=" + std::to_string(report.duplicate_observations)
+          + " rejected=" + std::to_string(report.rejected_invalid)
+          + " contradictions=" + std::to_string(report.contradictions_suppressed)
+          + " budget_truncations=" + std::to_string(ds.budget_truncations)
+          + " duration_ms=" + std::to_string(
+                diagnostic_elapsed_ms() - deobf_started_ms));
+  if ( deobf_store_sink->last_error()[0] != '\0' )
+    log_event(ViyLogLevel::SUMMARY,
+              "event=diagnostic scope=deobfuscation message=\""
+            + viy_sanitize_diagnostic(deobf_store_sink->last_error()) + "\"");
+  deobf_pending = false;
+  deobf_functions.clear();
+  set_diagnostic_phase(ViyDiagnosticPhase::SWEEPING_FUNCTIONS);
 }
 
 //-----------------------------------------------------------------------------
@@ -1384,6 +1437,21 @@ bool viy_t::process_batch(int count)
       log_skip(completion_reason.c_str());
       return false;
     }
+  }
+
+  if (deobf_pending)
+  {
+    if (!auto_is_ok())
+    {
+      if (!inline_mode)
+      {
+        emit_status();
+        return true;
+      }
+      auto_wait();
+    }
+    process_deobf_batch();
+    return true; // Give IDA the event loop before starting the next phase.
   }
 
   const size_t budget = size_t(std::max(count, 1));

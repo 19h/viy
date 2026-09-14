@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -199,6 +200,16 @@ public:
 
   std::vector<EvidenceConflict> detect_conflicts() const;
 
+  // For a valid normalized payload, find the first contradiction introduced
+  // by activating it in this generation (zero selects all observations).
+  // User assertions are always active. Corroborating an already-active
+  // payload cannot introduce a new payload-based conflict.
+  // Lazily indexes contradiction-capable subjects, then maintains that index
+  // on insertion. No ledger copies, re-encoding, or all-pairs scans per fact.
+  std::optional<EvidenceConflict> new_contradiction(
+      const FactPayload &payload, uint64_t generation,
+      ContradictionScanStats *stats = nullptr) const;
+
   // Fast path used by automatic application. It returns exactly the payload
   // identities participating in Contradiction-severity conflicts without
   // materializing Variation/Ambiguity pairs. Complexity is O(n log n + p),
@@ -228,6 +239,8 @@ private:
   // Canonical payload bytes are the key.  Hashes are exposed as stable IDs but
   // never used alone for identity, eliminating collision-based mis-dedup.
   std::map<std::vector<uint8_t>, EvidenceRecord> records_;
+  struct ContradictionIndex;
+  mutable std::unique_ptr<ContradictionIndex> contradiction_index_;
 };
 
 } // namespace analysis

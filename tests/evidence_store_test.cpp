@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <random>
 #include <set>
 #include <string>
 #include <utility>
@@ -661,6 +662,68 @@ void test_latest_generation_view()
          "active view serialization is deterministic across source insertion orders");
 }
 
+void check_incremental_contradictions(const EvidenceStore &fixture)
+{
+  auto facts = fixture.flattened_facts();
+  std::mt19937 random(0x19b);
+  const auto same = [](const EvidenceConflict &a, const EvidenceConflict &b)
+  { return !conflict_less(a, b) && !conflict_less(b, a); };
+  for (unsigned trial = 0; trial < 12; ++trial)
+  {
+    std::shuffle(facts.begin(), facts.end(), random);
+    EvidenceStore ledger;
+    for (auto fact : facts)
+    {
+      fact.evidence.scope.generation = 1 + random() % 2;
+      if (random() % 5 == 0)
+        fact.evidence.proof = ProofKind::UserAsserted;
+      for (uint64_t generation : {uint64_t{0}, uint64_t{1}, uint64_t{2}})
+      {
+        // Independent reference: reconstruct the active ledger and compare
+        // exhaustive before/after conflict identities, as the old sink did.
+        EvidenceStore view;
+        for (auto prior : ledger.flattened_facts())
+          if (generation == 0 || prior.evidence.scope.generation == generation ||
+              prior.evidence.proof == ProofKind::UserAsserted)
+            view.add(std::move(prior));
+        const auto before = view.detect_conflicts();
+        auto activated = fact;
+        activated.evidence.scope.generation = generation;
+        view.add(std::move(activated));
+        const auto after = view.detect_conflicts();
+        std::optional<EvidenceConflict> expected;
+        for (const auto &conflict : after)
+          if (conflict.severity == ConflictSeverity::Contradiction &&
+              std::none_of(before.begin(), before.end(),
+                           [&](const auto &old) { return same(old, conflict); }))
+          {
+            expected = conflict;
+            break;
+          }
+        const auto actual = ledger.new_contradiction(fact.payload, generation);
+        expect(actual.has_value() == expected.has_value(),
+               "indexed activation matches exhaustive generation-filtered conflict gate");
+        if (actual && expected)
+          expect(same(*actual, *expected), "indexed gate preserves first conflict identity");
+      }
+      ledger.add(fact); // Include preexisting contradictions and corroboration.
+      expect(!ledger.new_contradiction(fact.payload, 0),
+             "additional observations cannot introduce payload conflicts");
+      // Exercise index lifetime across copy/move and replacement.
+      if (random() % 3 == 0)
+      {
+        EvidenceStore moved(std::move(ledger));
+        ledger = std::move(moved);
+        EvidenceStore copy(ledger);
+        ledger.clear();
+        ledger = copy;
+        copy = std::move(ledger);
+        ledger = std::move(copy);
+      }
+    }
+  }
+}
+
 void test_conflicts()
 {
   EvidenceStore store;
@@ -857,6 +920,46 @@ void test_conflicts()
          "fast contradiction scan accounts for every canonical record");
   expect(contradiction_stats.payload_digests_computed == fast_contradicted.size(),
          "fast contradiction scan hashes only participating payloads");
+  check_incremental_contradictions(store);
+}
+
+void test_incremental_index_scaling()
+{
+  EvidenceStore store;
+  ContradictionScanStats stats;
+  for (Address i = 0; i < 20000; ++i)
+  {
+    const FactPayload payload = CodeTargetFact{i, i + 1, CodeTargetKind::Jump, true};
+    expect(!store.new_contradiction(payload, 0, &stats), "unrelated targets are compatible");
+    expect(stats.records_indexed == 0 && stats.candidate_relations_examined == 0 &&
+             stats.payload_digests_computed == 0,
+           "incremental query neither rebuilds nor hashes or compares unrelated records");
+    const auto result = store.add(observed(payload, i, i));
+    FactDigest expected;
+    expect(stable_digest(payload, expected) && expected == result.payload_digest,
+           "hashing stored canonical bytes preserves the stable digest");
+  }
+  const FactPayload conflict = CodeTargetFact{9999, 99999, CodeTargetKind::Jump, true};
+  expect(store.new_contradiction(conflict, 0, &stats).has_value(), "indexed target found");
+  expect(stats.candidate_relations_examined == 1 && stats.payload_digests_computed == 2,
+         "only the same subject is compared and only actual conflict payloads are hashed");
+  EvidenceStore moved(std::move(store));
+  expect(moved.new_contradiction(conflict, 0, &stats).has_value() && stats.records_indexed == 0,
+         "move construction preserves index pointers into transferred map nodes");
+  store = std::move(moved);
+  expect(store.new_contradiction(conflict, 0, &stats).has_value() && stats.records_indexed == 0,
+         "move assignment preserves a built index");
+  store.clear();
+  const Address top = std::numeric_limits<Address>::max();
+  store.add(observed(CodeRegionFact{0, top, CodeRegionKind::Code}, 1, 1));
+  expect(store.new_contradiction(CodeRegionFact{top - 1, top, CodeRegionKind::Data}, 0)
+             .has_value(), "interval index finds very long regions without overflow");
+  store.clear();
+  store.add(observed(CodeRegionFact{0, 1, CodeRegionKind::Data}, 1, 1));
+  expect(!store.new_contradiction(CodeRegionFact{1, 2, CodeRegionKind::Code}, 0),
+         "adjacent half-open regions do not overlap");
+  expect(store.new_contradiction(CodeRegionFact{0, 2, CodeRegionKind::Code}, 0).has_value(),
+         "interval index includes regions starting at zero");
 }
 
 void test_persistence_adapter()
@@ -907,6 +1010,7 @@ int main()
   test_generation_lifecycle_regression();
   test_latest_generation_view();
   test_conflicts();
+  test_incremental_index_scaling();
   test_persistence_adapter();
 
   if (failures != 0)

@@ -16,7 +16,7 @@
 #   cmake --build build
 # ============================================================================
 cmake_minimum_required(VERSION 3.27)
-project(viy CXX)
+project(viy VERSION 1.0.0 LANGUAGES CXX)
 
 include(CTest)
 option(VIY_TEST_SANITIZERS "Build pure viy tests with ASan and UBSan" OFF)
@@ -32,9 +32,7 @@ if(NOT IDA_CMAKE_DIR)
   endif()
 endif()
 if(NOT IDA_CMAKE_DIR)
-  message(FATAL_ERROR
-    "ida-cmake location is required. Set -DIDA_CMAKE_DIR=/path/to/ida-cmake "
-    "or export IDA_CMAKE_DIR.")
+  set(IDA_CMAKE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ida-cmake")
 endif()
 if(NOT EXISTS "${IDA_CMAKE_DIR}/bootstrap.cmake")
   message(FATAL_ERROR
@@ -71,6 +69,8 @@ if(NOT EXISTS "${RAX_CAPI_DIR}/Cargo.toml")
 endif()
 
 set(RAX_CARGO_PROFILE "release" CACHE STRING "Cargo profile used for embedded rax")
+set(RAX_CARGO_TARGET "" CACHE STRING
+    "Rust target triple for embedded rax (empty uses Cargo's host default)")
 set(RAX_FEATURES "" CACHE STRING
     "Optional embedded rax Cargo features (semicolon-separated)")
 find_program(VIY_CARGO_EXECUTABLE cargo REQUIRED)
@@ -94,8 +94,14 @@ if(RAX_FEATURES)
 endif()
 
 set(_rax_target_dir "${CMAKE_CURRENT_BINARY_DIR}/rax-capi/cargo")
+set(_rax_target_args "")
+set(_rax_archive_dir "${_rax_target_dir}")
+if(RAX_CARGO_TARGET)
+  set(_rax_target_args --target "${RAX_CARGO_TARGET}")
+  string(APPEND _rax_archive_dir "/${RAX_CARGO_TARGET}")
+endif()
 set(_rax_static_path
-    "${_rax_target_dir}/${_rax_profile_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}rax${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    "${_rax_archive_dir}/${_rax_profile_dir}/${CMAKE_STATIC_LIBRARY_PREFIX}rax${CMAKE_STATIC_LIBRARY_SUFFIX}")
 set(_rax_cargo_environment "CARGO_TARGET_DIR=${_rax_target_dir}")
 if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET)
   # Cargo build scripts (notably cc-rs dependencies) otherwise compile for the
@@ -103,12 +109,26 @@ if(APPLE AND CMAKE_OSX_DEPLOYMENT_TARGET)
   list(APPEND _rax_cargo_environment
        "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
 endif()
+if(WIN32)
+  # The SDK release plugin uses /MT. Match Rust and cc-rs dependencies to it.
+  set(_rax_windows_rustflags "$ENV{RUSTFLAGS} -Ctarget-feature=+crt-static")
+  if(RAX_CARGO_TARGET MATCHES "^x86_64-" OR
+     (NOT RAX_CARGO_TARGET AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$"))
+    string(APPEND _rax_windows_rustflags " -Ctarget-cpu=x86-64-v3")
+  endif()
+  list(APPEND _rax_cargo_environment
+       "RUSTFLAGS=${_rax_windows_rustflags}")
+  if(RAX_CARGO_TARGET)
+    string(REPLACE "-" "_" _rax_cc_target "${RAX_CARGO_TARGET}")
+    list(APPEND _rax_cargo_environment "CFLAGS_${_rax_cc_target}=/MT")
+  endif()
+endif()
 
 add_custom_target(viy_rax_cargo
   COMMAND ${CMAKE_COMMAND} -E env ${_rax_cargo_environment}
-          ${VIY_CARGO_EXECUTABLE} build --package rax-capi
+          ${VIY_CARGO_EXECUTABLE} build --locked --package rax-capi
           --manifest-path "${RAX_CAPI_DIR}/Cargo.toml"
-          ${_rax_profile_args} ${_rax_feature_args}
+          ${_rax_profile_args} ${_rax_feature_args} ${_rax_target_args}
   BYPRODUCTS "${_rax_static_path}"
   WORKING_DIRECTORY "${RAX_CAPI_DIR}"
   COMMENT "Building embedded rax staticlib via Cargo (${RAX_CARGO_PROFILE})"
@@ -474,8 +494,8 @@ endif()
 # This overrides ida_add_plugin's default of installing straight into
 # IDA_PLUGIN_DIR; use `make install` (or the install target) to deploy.
 set_target_properties(viy PROPERTIES
-  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  LIBRARY_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}>"
+  RUNTIME_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}>")
 
 message(STATUS
   "viy: IDASDK=$ENV{IDASDK}  ida-cmake=${IDA_CMAKE_DIR}  "

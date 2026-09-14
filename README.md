@@ -341,6 +341,20 @@ Architecture detection and each provider are independently gated.
 viy asks `rax_engine_supports_stepping` and disables dynamic discovery for an
 engine that cannot be driven.
 
+## CI and releases
+
+[GitHub Actions](.github/workflows/build.yml) builds native x86-64 and ARM64
+plugins for macOS, Linux, and Windows on branch pushes and pull requests.
+Each lane runs the IDA-free viy tests and verifies its artifact's architecture;
+Unix lanes also run the RAX C API suite. The IDA 9.4 SDK is pinned per platform,
+and Cargo uses the committed lockfile.
+
+Pushing a `v*` tag publishes the six platform binaries and `SHA256SUMS` only
+after every build/test lane succeeds. Release files are named
+`viy_<platform>.<extension>`; rename the selected binary to `viy.dylib`,
+`viy.so`, or `viy.dll` when installing it in IDA's plugins directory.
+See [CI verification and assumptions](docs/ci-release.md) for platform boundaries.
+
 ## Building
 
 rax is a git submodule under `vendor/rax`. The Makefile builds its C API as a
@@ -350,7 +364,6 @@ Rust static library, links it into viy, and stages one plugin artifact in
 ```sh
 git submodule update --init --depth 1 vendor/rax
 export IDASDK=/path/to/ida-sdk
-export IDA_CMAKE_DIR=/path/to/ida-cmake
 make
 ```
 
@@ -363,12 +376,13 @@ licensed persistence/recovery harness.
 | Make/CMake setting | Default | Purpose |
 |---|---|---|
 | `IDASDK` | required | IDA SDK root used by `ida-cmake`. |
-| `IDA_CMAKE_DIR` | required | `ida-cmake` checkout; may also be supplied through the environment. |
+| `IDA_CMAKE_DIR` | bundled `ida-cmake` | Override the SDK build helper through CMake or the environment. |
 | `BUILD_DIR` | `build` | Makefile CMake/staging directory. |
 | `DEBUG` | `0` | `0` selects Release; `1` selects Debug. |
 | `CMAKE_FLAGS` | empty | Additional arguments passed by the Makefile configure step. |
 | `RAX_CAPI_DIR` | `vendor/rax/capi` | rax-capi source path containing `Cargo.toml`, `CMakeLists.txt`, and `include/rax.h`. |
 | `RAX_CARGO_PROFILE` | `release` | Cargo profile for the embedded Rust static library. |
+| `RAX_CARGO_TARGET` | empty (host) | Explicit Rust target triple; CI selects the same architecture as the plugin. |
 | `RAX_FEATURES` | empty | Semicolon-separated optional rax features forwarded to Cargo. |
 | `BUILD_TESTING` | CTest default (`ON`) | Build/register IDA-free tests. |
 | `VIY_TEST_STRICT_WARNINGS` | `ON` | Compile pure tests with strict warnings as errors on Clang/GCC. |

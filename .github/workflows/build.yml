@@ -1,0 +1,244 @@
+name: Build and release viy
+
+on:
+  push:
+    branches: [master, main]
+    tags: ['v*']
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: viy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SDK revisions match Chernobog's native release lanes. Windows uses
+          # the base 9.4 ABI, before reg_finder94_find_reg_value_info was added.
+          - name: macos-x86_64
+            os: macos-15-intel
+            arch: x86_64
+            target: x86_64-apple-darwin
+            sdk: 6929db6868a524496eb66e76e4ec6c9d720a0594
+          - name: macos-arm64
+            os: macos-latest
+            arch: arm64
+            target: aarch64-apple-darwin
+            sdk: 6929db6868a524496eb66e76e4ec6c9d720a0594
+          - name: linux-x86_64
+            os: ubuntu-latest
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            sdk: 6929db6868a524496eb66e76e4ec6c9d720a0594
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+            sdk: 6929db6868a524496eb66e76e4ec6c9d720a0594
+          - name: windows-x86_64
+            os: windows-latest
+            arch: x64
+            target: x86_64-pc-windows-msvc
+            sdk: f45fa5149caac89a954d1d82cd9d76b3899ee6a6
+          - name: windows-arm64
+            os: windows-11-arm
+            arch: ARM64
+            target: aarch64-pc-windows-msvc
+            sdk: f45fa5149caac89a954d1d82cd9d76b3899ee6a6
+    defaults:
+      run:
+        shell: bash
+    env:
+      IDASDK: ${{ github.workspace }}/ida-sdk
+      CARGO_TARGET_DIR: ${{ github.workspace }}/build/rax-capi/cargo
+      RUSTUP_TOOLCHAIN: stable
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPRESS: 'true'
+      CCACHE_MAXSIZE: 1G
+
+    steps:
+      - name: Checkout viy and RAX
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Checkout IDA SDK
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: HexRaysSA/ida-sdk
+          ref: ${{ matrix.sdk }}
+          path: ida-sdk
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        id: toolchain
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add "$RUST_TARGET"
+          rustc --version --verbose
+          printf 'version=%s\n' "$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+          git submodule status --recursive
+
+      - name: Test release packaging checks
+        run: python tests/package_plugin_test.py
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ccache
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          if ! command -v ccache >/dev/null 2>&1; then
+            brew install ccache
+          fi
+
+      - name: Restore Cargo build cache
+        id: cargo_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/rax-capi/cargo
+          key: cargo-v1-${{ matrix.target }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vendor/rax/Cargo.lock', 'CMakeLists.txt', '.github/workflows/build.yml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-v1-${{ matrix.target }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vendor/rax/Cargo.lock', 'CMakeLists.txt', '.github/workflows/build.yml') }}-
+
+      - name: Restore C++ cache
+        id: ccache
+        if: runner.os != 'Windows'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .ccache
+          key: ccache-v1-${{ matrix.name }}-${{ matrix.sdk }}-${{ hashFiles('CMakeLists.txt', 'ida-cmake/**', '.github/workflows/build.yml') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-v1-${{ matrix.name }}-${{ matrix.sdk }}-${{ hashFiles('CMakeLists.txt', 'ida-cmake/**', '.github/workflows/build.yml') }}-
+
+      - name: Configure Unix
+        if: runner.os != 'Windows'
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+          CMAKE_ARCH: ${{ matrix.arch }}
+        run: |
+          args=(-DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+                "-DRAX_CARGO_TARGET=$RUST_TARGET")
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            args+=("-DCMAKE_OSX_ARCHITECTURES=$CMAKE_ARCH"
+                   -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0)
+          fi
+          cmake -S . -B build "${args[@]}"
+
+      - name: Configure Windows MSVC
+        if: runner.os == 'Windows'
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+          CMAKE_ARCH: ${{ matrix.arch }}
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A "$env:CMAKE_ARCH" -DBUILD_TESTING=ON `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded "-DRAX_CARGO_TARGET=$env:RUST_TARGET"
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed' }
+          $metadata = Get-ChildItem build -Recurse -Filter CMakeCXXCompiler.cmake |
+            ForEach-Object { Get-Content $_.FullName -Raw } | Out-String
+          if ($metadata -notmatch 'CMAKE_CXX_COMPILER_ID "MSVC"') {
+            throw 'Windows release binaries require native MSVC'
+          }
+
+      - name: Build
+        run: cmake --build build --config Release --parallel 3
+
+      # Separate save steps retain successful compilation work even if tests fail.
+      - name: Save Cargo build cache
+        if: always() && steps.cargo_cache.outputs.cache-primary-key != '' && steps.cargo_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/rax-capi/cargo
+          key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
+
+      - name: Save C++ cache
+        if: always() && runner.os != 'Windows' && steps.ccache.outputs.cache-primary-key != '' && steps.ccache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Run viy tests
+        run: ctest --test-dir build --build-config Release --output-on-failure --no-tests=error
+
+      - name: Run RAX C API tests (Unix)
+        if: runner.os != 'Windows'
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+          MACOSX_DEPLOYMENT_TARGET: '15.0'
+        working-directory: vendor/rax/capi
+        run: cargo test --locked --release -p rax-capi --target "$RUST_TARGET"
+
+      - name: Verify and package plugin
+        env:
+          PLATFORM: ${{ matrix.name }}
+        run: python scripts/package_plugin.py --build-dir build --platform "$PLATFORM" --output-dir artifacts
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: viy-${{ matrix.name }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish tagged release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download plugin artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: viy-*
+          path: release
+          merge-multiple: true
+      - name: Verify complete release
+        shell: bash
+        run: |
+          set -euo pipefail
+          for asset in viy_macos-x86_64.dylib viy_macos-arm64.dylib \
+                       viy_linux-x86_64.so viy_linux-arm64.so \
+                       viy_windows-x86_64.dll viy_windows-arm64.dll; do
+            test -s "release/$asset"
+          done
+          (cd release && sha256sum viy_*.dylib viy_*.so viy_*.dll > SHA256SUMS)
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

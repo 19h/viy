@@ -229,10 +229,12 @@ ViyAbiInputPlan viy_plan_abi_input(const ViyAbiLayout &layout,
     ViyAbiStackWrite write;
     write.address = destination;
     write.size = layout.pointer_size;
-    for ( size_t byte = 0; byte < layout.pointer_size; ++byte )
+    // Keep the storage bound visible to GCC's optimized overflow analysis;
+    // supported ABI widths were already validated as four or eight bytes.
+    for ( size_t byte = 0; byte < write.bytes.size() && byte < write.size; ++byte )
     {
       const size_t shift_index = big_endian
-                               ? size_t(layout.pointer_size) - 1 - byte : byte;
+                               ? size_t(write.size) - 1 - byte : byte;
       write.bytes[byte] = uint8_t(value >> (8 * shift_index));
     }
     result.stack.push_back(write);

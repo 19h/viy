@@ -202,6 +202,41 @@ void check_placements()
         == ViyAbiPlanError::STACK_OUT_OF_RANGE);
 }
 
+void check_stack_serialization_bounds()
+{
+  constexpr uint64_t sp = 0x70008000;
+  EmuInput input;
+  input.stack_args = {0x0123456789ABCDEFull};
+  for ( unsigned width = 0; width <= 255; ++width )
+  {
+    ViyAbiLayout layout = viy_abi_layout(ViyAbi::X86_32);
+    layout.pointer_size = static_cast<uint8_t>(width);
+    for ( bool big_endian : {false, true} )
+    {
+      const auto plan = viy_plan_abi_input(
+          layout, input, sp, 0x70000000, 0x10000, big_endian);
+      if ( width != 4 && width != 8 )
+      {
+        CHECK(plan.error == ViyAbiPlanError::UNSUPPORTED_ABI);
+        CHECK(plan.stack.empty() && plan.registers.empty());
+        continue;
+      }
+      CHECK(plan.valid() && plan.stack.size() == 1);
+      if ( plan.stack.size() != 1 )
+        continue;
+      const auto &write = plan.stack.front();
+      CHECK(write.address == sp + width && write.size == width);
+      const std::array<uint8_t, 8> little = {0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01};
+      for ( size_t index = 0; index < write.bytes.size(); ++index )
+      {
+        const uint8_t expected = index >= width ? 0
+            : little[big_endian ? width - 1 - index : index];
+        CHECK(write.bytes[index] == expected);
+      }
+    }
+  }
+}
+
 void check_seed_corpus()
 {
   constexpr uint64_t image = 0x100000;
@@ -274,6 +309,7 @@ int main()
 {
   check_layouts();
   check_placements();
+  check_stack_serialization_bounds();
   check_seed_corpus();
   if ( failures != 0 )
   {

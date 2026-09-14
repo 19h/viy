@@ -100,3 +100,30 @@ Primary references:
 - [Artifact download action](https://github.com/actions/download-artifact)
 - [Actions cache](https://github.com/actions/cache)
 - [Chernobog source workflow](https://github.com/19h/chernobog/blob/c4440677e39f296e18bbd6f82eab50b878cebead/.github/workflows/build.yml)
+
+## Linux CI repair (2026-09-14)
+
+Run [34821164019](https://github.com/19h/viy/actions/runs/34821164019)
+failed in both Linux build jobs on GCC 13's optimized
+`-Werror=stringop-overflow` diagnostic in ABI stack-argument serialization.
+The implementation validated four/eight-byte pointers, but the variable loop
+bound did not retain that proof through optimization. The loop now explicitly
+bounds its writes by the eight-byte destination array as well as the validated
+ABI width. Exhaustive tests cover all 256 representable widths and both byte
+orders, including exact bytes, zero tail bytes and rejection of invalid widths.
+
+A broader GCC 13.4 check also exposed `-Werror=nonnull` in libstdc++'s inlined
+initializer-list assignment in the loaded-byte-view test fixture. Resizing the
+three-byte mask and filling its entries explicitly preserves the test corpus
+and avoids that diagnostic. Warning flags remain enabled.
+
+Verification: the original ABI source reproduces the CI diagnostic with GCC
+13.4 at `-O3`; the fixed source and ABI tests pass under the same flags. All
+16 C++ test targets pass GCC compilation with the strict warning set: the
+12 IDA/RAX-independent executables run successfully in Linux, and the four
+RAX-linked targets receive compile checks there. The macOS ARM64 plugin links
+and all 16 CTest cases pass, including the RAX-linked cases. This local Linux
+check does not claim a Linux plugin or RAX archive link.
+
+The published `v1.0.0` tag identifies the original workflow commit `ff3acea`.
+Repair commits do not automatically change that tag or rebuild its release.

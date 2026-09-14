@@ -239,7 +239,10 @@ void view_regressions()
   segment.bytes.assign(24, 0x90);
   for (unsigned mask = 0; mask < 256; ++mask)
   {
-    segment.mask = {255, static_cast<uint8_t>(mask), 255};
+    segment.mask.resize(3);
+    segment.mask[0] = 255;
+    segment.mask[1] = static_cast<uint8_t>(mask);
+    segment.mask[2] = 255;
     for (uint64_t address = 16; address <= 42; ++address)
       for (size_t maximum = 0; maximum <= 32; ++maximum)
         verify(segment, address, maximum);

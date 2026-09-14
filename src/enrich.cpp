@@ -114,7 +114,22 @@ EnrichStats viy_enrich(const EmuEvents &ev, const ViyConfig &cfg)
       if ( decode_insn(&insn, from) <= 0 )
         continue;
       if ( (insn.get_canon_feature(PH) & (CF_CALL | CF_JUMP)) == 0 )
-        continue; // only annotate the indirect transfers viy resolved
+        continue;
+      // CF_CALL/CF_JUMP identify transfers, not indirection. A near/far
+      // operand already displays the encoded destination in the listing.
+      bool direct = false;
+      for ( const op_t &operand : insn.ops )
+      {
+        if ( operand.type == o_void )
+          break;
+        if ( operand.type == o_near || operand.type == o_far )
+        {
+          direct = true;
+          break;
+        }
+      }
+      if ( direct )
+        continue;
       qstring txt;
       txt.sprnt("viy: -> %s", ea_label(to).c_str());
       if ( add_rpt_comment(from, txt.c_str()) )

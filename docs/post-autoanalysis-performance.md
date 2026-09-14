@@ -282,3 +282,28 @@ range/fallback tests). **Medium-impact tradeoff:** private-use text and text
 whose bytes also encode mapped pointers are suppressed without additional
 type/consumer evidence. Unmapped or unaligned pointer values remain a possible
 source of ambiguity; the detector is not a general proof of string semantics.
+
+## Redundant direct-transfer comments
+
+`viy_enrich` previously tested only `CF_CALL | CF_JUMP` before adding a resolved
+target comment. These features identify transfers, not indirection. It now
+excludes instructions with `o_near` or `o_far` operands, whose encoded targets
+IDA already displays. Register/memory indirect-transfer annotations remain.
+The additional scan costs O(EK) time and O(1) space for E observed edges and
+the SDK's fixed maximum K operands. Existing comments remain in the database.
+
+Assumption: the processor module represents encoded transfer destinations as
+near/far operands. Disposable x86-64 and ARM64 IDBs test that assumption: all
+9 and 10 direct transfers respectively have no `viy: ->` annotation, while
+each fixture retains one indirect-transfer annotation and persisted SMIR
+evidence. The Release plugin build and all 18 CTest cases pass.
+
+**Medium-impact adjacent finding:** runtime pointer-table comments currently
+describe a heuristic, not a recovered type. Two adjacent slots, each with one
+observed in-image target across at least two runs and no conflicting writes,
+can qualify when at least one target is executable or a same-function execution
+edge follows a matching pointer read. That correlation is not def-use proof
+and does not distinguish direct from indirect edges. The repeatable comment
+is attached to the first data slot and can therefore appear at multiple code
+references. Adjacent globals/import slots can satisfy these conditions; the
+object type in the supplied screenshot is unknown.

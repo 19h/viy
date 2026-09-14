@@ -250,6 +250,80 @@ void test_utf16_and_utf32()
   }
 }
 
+void test_pointer_words_are_not_strings()
+{
+  constexpr uint64_t stack = 0x7ffd00000000ull;
+  CHECK(viy::viy_scratch_stack_base(true, 0, 0x200000) == stack);
+  CHECK(viy::viy_scratch_stack_base(true, stack, stack + 1) == 0x600000000000ull);
+  for (bool big_endian : {false, true})
+  {
+    for (uint32_t low : {0xFFC00u, 0x4E2Du})
+    {
+      // Exact reported pointer; second variant uses assigned CJK scalars,
+      // proving rejection is not merely the private-use character filter.
+      std::vector<uint8_t> bytes;
+      for (size_t i = 0; i < 3; ++i)
+      {
+        append_u32(&bytes, big_endian ? 0x7FFDu : low, big_endian);
+        append_u32(&bytes, big_endian ? low : 0x7FFDu, big_endian);
+      }
+      append_u32(&bytes, 0, big_endian);
+      append_u32(&bytes, 0, big_endian);
+      StringScanOptions options = nul_options(big_endian);
+      options.allow_length_prefixed = true;
+      options.pointer_ranges = {{stack, stack + viy::kViyScratchStackSize}};
+      std::vector<MemoryBytes> runs;
+      for (uint32_t run = 0; run < 10; ++run)
+        runs.push_back(observation(stack + 0xFFBA0, bytes, DataScope::STACK, run, run));
+      CHECK(viy::runtime_core::collect_string_groups(runs, options).groups.empty());
+
+      // Pointer rejection must not hide real strings adjacent to pointer saves.
+      const std::vector<uint8_t> text{'h', 'e', 'l', 'l', 'o', 0};
+      const size_t text_offset = bytes.size();
+      bytes.insert(bytes.end(), text.begin(), text.end());
+      const auto adjacent = scan(bytes, options, stack + 0xFFBA0, DataScope::STACK);
+      CHECK(has_string_at(adjacent, stack + 0xFFBA0 + text_offset));
+      CHECK(adjacent.groups.size() == 1);
+    }
+    // Non-ASCII text remains supported; neither script nor Unicode width is
+    // used as a reason to discard a string when it does not overlap pointers.
+    std::vector<uint8_t> cjk;
+    for (uint32_t cp : {0x4E2Du, 0x6587u, 0x5B57u, 0x7B26u, 0u})
+      append_u32(&cjk, cp, big_endian);
+    auto options = nul_options(big_endian);
+    options.pointer_ranges = {{stack, stack + viy::kViyScratchStackSize}};
+    CHECK(only_string(scan(cjk, options, stack + 0xFFBA0, DataScope::STACK)).codepoints.size() == 4);
+  }
+
+  for (uint32_t cp : {0xE000u, 0xF8FFu, 0xF0000u, 0xFFFFDu, 0x100000u,
+                      0x10FFFDu, 0xFDD0u, 0xFDEFu, 0xFFFEu, 0x1FFFFu, 0x10FFFFu})
+  {
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < 4; ++i)
+      append_u32(&bytes, cp, false);
+    append_u32(&bytes, 0, false);
+    const auto rejected = scan(bytes, nul_options());
+    for (const auto &entry : rejected.groups)
+    {
+      CHECK(entry.first.addr != 0x1000 || entry.first.encoding != RuntimeEncoding::UTF32_LE);
+      CHECK(std::find(entry.second.codepoints.begin(), entry.second.codepoints.end(), cp)
+            == entry.second.codepoints.end());
+    }
+  }
+
+  for (bool big_endian : {false, true})
+  {
+    std::vector<uint8_t> words{1}; // observation starts before an aligned pointer
+    for (size_t i = 0; i < 3; ++i)
+      append_u32(&words, 0x60004E2D, big_endian);
+    append_u32(&words, 0, big_endian);
+    auto options = nul_options(big_endian);
+    options.pointer_width = 4;
+    options.pointer_ranges = {{0x60000000, 0x60010000}};
+    CHECK(scan(words, options, 0x70000003, DataScope::STACK).groups.empty());
+  }
+}
+
 void test_bounds_offsets_scopes_and_determinism()
 {
   CHECK(scan({ 'a', 'b', 'c', 0 }, nul_options()).groups.empty());
@@ -463,6 +537,7 @@ int main()
   test_write_grouping_and_conflicts();
   test_ascii_and_strict_utf8();
   test_utf16_and_utf32();
+  test_pointer_words_are_not_strings();
   test_bounds_offsets_scopes_and_determinism();
   test_length_prefixed_strings();
   test_temporal_correlations();

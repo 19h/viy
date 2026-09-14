@@ -4,6 +4,7 @@
 #include "runtime_enrich_core.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 #include <utility>
 
@@ -45,6 +46,15 @@ bool scalar_is_text(uint32_t cp)
   if ( cp == '\t' || cp == '\n' || cp == '\r' )
     return true;
   if ( cp < 0x20 || (cp >= 0x7F && cp <= 0x9F) )
+    return false;
+  // Unicode-valid does not imply evidence of text. Private-use code points
+  // require external semantics; noncharacters have no assigned text meaning.
+  // This is an automatic-recognition policy, not UTF encoding validation.
+  if ((cp >= 0xE000 && cp <= 0xF8FF)
+    || (cp >= 0xF0000 && cp <= 0xFFFFD)
+    || (cp >= 0x100000 && cp <= 0x10FFFD)
+    || (cp >= 0xFDD0 && cp <= 0xFDEF)
+    || (cp & 0xFFFF) >= 0xFFFE)
     return false;
   return cp <= 0x10FFFF && !(cp >= 0xD800 && cp <= 0xDFFF);
 }
@@ -647,13 +657,64 @@ StringCollection collect_string_groups(
     return result;
   }
 
+  // Sort/merge once, then classify pointer words with logarithmic range lookup.
+  auto ranges = options.pointer_ranges;
+  std::sort(ranges.begin(), ranges.end());
+  std::vector<std::pair<uint64_t, uint64_t>> mapped;
+  for (const auto &range : ranges)
+  {
+    if (range.first >= range.second)
+      continue;
+    if (!mapped.empty() && range.first <= mapped.back().second)
+      mapped.back().second = std::max(mapped.back().second, range.second);
+    else
+      mapped.push_back(range);
+  }
+  const auto is_pointer = [&](uint64_t value)
+  {
+    if (value == 0)
+      return false; // Null words also provide string terminators/padding.
+    auto it = std::upper_bound(mapped.begin(), mapped.end(), value,
+        [](uint64_t address, const auto &range) { return address < range.first; });
+    return it != mapped.begin() && value < std::prev(it)->second;
+  };
+
   for ( const MemoryBytes &observation : observations )
   {
+    std::vector<size_t> pointer_offsets;
+    const size_t width = options.pointer_width;
+    if (!mapped.empty() && (width == 4 || width == 8))
+    {
+      const size_t first = (width - size_t(observation.addr % width)) % width;
+      for (size_t off = first; off < observation.bytes.size()
+           && observation.bytes.size() - off >= width; off += width)
+      {
+        uint64_t value = 0;
+        for (size_t i = 0; i < width; ++i)
+        {
+          const size_t byte = options.image_big_endian ? i : width - i - 1;
+          value = (value << 8) | observation.bytes[off + byte];
+        }
+        if (is_pointer(value))
+          pointer_offsets.push_back(off);
+      }
+    }
+    const auto overlaps_pointer = [&](size_t start, size_t length)
+    {
+      const auto it = std::lower_bound(pointer_offsets.begin(), pointer_offsets.end(), start);
+      return (it != pointer_offsets.end() && *it - start < length)
+          || (it != pointer_offsets.begin() && start - *std::prev(it) < width);
+    };
     size_t offset = 0;
     size_t count = 0;
     while ( offset < observation.bytes.size()
          && count < options.max_candidates_per_write )
     {
+      if (overlaps_pointer(offset, 1))
+      {
+        ++offset;
+        continue;
+      }
       const size_t remaining = observation.bytes.size() - offset;
       const size_t probe_size = std::min(options.max_candidate_bytes, remaining);
       const uint8_t *probe = observation.bytes.data() + offset;
@@ -692,6 +753,14 @@ StringCollection collect_string_groups(
         observation.addr + static_cast<uint64_t>(offset);
       uint64_t candidate_end = 0;
       if ( !checked_end(candidate_addr, selected->raw_size, &candidate_end) )
+      {
+        ++offset;
+        continue;
+      }
+
+      // Reject every interpretation, including shifted suffixes, that overlaps
+      // an actual mapped pointer word. Run agreement cannot resolve that ambiguity.
+      if (overlaps_pointer(offset, selected->raw_size))
       {
         ++offset;
         continue;

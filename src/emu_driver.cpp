@@ -29,7 +29,6 @@ namespace viy {
 namespace {
 
 constexpr uint64_t kPage      = 0x1000;
-constexpr uint64_t kStackSize = 0x100000;           // 1 MiB scratch stack
 constexpr uint64_t kMaxCtx    = 512ull * 1024 * 1024; // cap snapshot buffer size
 
 inline uint64_t page_down(uint64_t x) { return x & ~(kPage - 1); }
@@ -870,26 +869,10 @@ EmuDriver::EmuDriver(const RaxApi *api, const ProgramImage &img, bool strict_per
   // Choose a scratch stack region that does not intersect the image. This region
   // doubles as the engine's initial (default) mapping, so it never collides with
   // the image maps below.
-  static const uint64_t cand64[] = { 0x00007ffd00000000ull, 0x0000600000000000ull, 0x0000000120000000ull };
-  static const uint64_t cand32[] = { 0x70000000ull, 0x50000000ull, 0x10000000ull };
-  const uint64_t *cands = is64 ? cand64 : cand32;
-  const size_t ncand = is64 ? 3 : 3;
-  stack_size_ = kStackSize;
-  bool chosen = false;
-  for ( size_t i = 0; i < ncand; ++i )
-  {
-    const uint64_t b = cands[i];
-    const uint64_t e = b + stack_size_;
-    const bool intersects = img_.hi > img_.lo && b < img_.hi && img_.lo < e;
-    if ( !intersects )
-    {
-      stack_base_ = b;
-      chosen = true;
-      break;
-    }
-  }
-  if ( !chosen )
-    return; // no scratch-stack region clear of the image; leave the engine closed (no-op)
+  stack_size_ = kViyScratchStackSize;
+  stack_base_ = viy_scratch_stack_base(is64, img_.lo, img_.hi);
+  if (stack_base_ == 0)
+    return; // no scratch region clear of the image
   sentinel_ = stack_base_ + kPage;
 
   rax_engine_config cfg;

@@ -242,3 +242,43 @@ pass ASan/UBSan; changed IDA-free sources also compile under Ubuntu GCC 13.3
 with Release warnings-as-errors. End-to-end latency and peak-memory changes
 on the user's alpha database remain unmeasured; reprofile after loading this
 build to test the claim that the sampled RAX audit stack has left the UI thread.
+
+## Saved pointers misclassified as runtime strings
+
+The supplied `sub_10FC` listing's six alleged UTF-32LE scalars are
+`[0xFFC00, 0x7FFD]` repeated three times. Pairing each low/high 32-bit word
+reconstructs the same 64-bit value, `0x00007FFD000FFC00`, three times. The
+`STP X8, X8` / `STR X8` sequence saves a variadic cursor pointing above the
+current stack frame. Ten identical observations corroborate saved pointer
+bytes; they do not establish a string.
+
+The automatic detector now rejects candidates overlapping aligned pointer
+words that reference known image segments or the actual synthetic scratch
+region. Scratch-region selection is shared with the emulator, including its
+fallback mappings. Rejection also covers shifted candidate suffixes. Null
+words remain eligible as string terminators. Range preparation costs O(R log R)
+for R ranges; pointer classification costs O((B/P) log R) for B observed bytes
+and P-byte pointers, with O(R + B/P) auxiliary storage. Existing bounded string
+decoding costs are unchanged; known pointer interiors skip decoding entirely.
+
+Private-use and noncharacter scalars are also excluded from automatic string
+recognition. This is a conservative recognition policy, not a claim that
+private-use characters are invalid Unicode. Their semantics require external
+agreement; see [Unicode 17.0, sections 23.5 and 23.7](https://www.unicode.org/versions/Unicode17.0.0/core-spec/chapter-23/).
+Writer comments now identify string candidates and state that runs agree on
+bytes. Existing IDB comments are not automatically removed.
+
+Regression coverage includes the exact ten-run example, a pointer whose halves
+are both assigned CJK scalars, both byte orders, 32-bit pointer words in an
+unaligned observation, adjacent real text, and legitimate CJK UTF-32. The old
+detector fails the exact-example regression; the corrected detector passes.
+An ARM64 disposable-IDB plugin run with repeated saved frame pointers produced
+no runtime-string annotation and retained SMIR evidence.
+
+Assumptions and limits: the displayed UTF-32 scalars faithfully represent the
+observed bytes (the listing independently reconstructs the pointer); mapped
+ranges describe the captured image and shared scratch selection (covered by
+range/fallback tests). **Medium-impact tradeoff:** private-use text and text
+whose bytes also encode mapped pointers are suppressed without additional
+type/consumer evidence. Unmapped or unaligned pointer values remain a possible
+source of ambiguity; the detector is not a general proof of string semantics.

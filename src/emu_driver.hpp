@@ -22,6 +22,25 @@ struct rax_engine; // opaque
 
 namespace viy {
 
+inline constexpr uint64_t kViyScratchStackSize = 0x100000;
+
+// Shared with runtime-value classification so synthetic pointer words cannot
+// be mistaken for text. Zero means none of the reserved regions is available.
+inline uint64_t viy_scratch_stack_base(bool is64, uint64_t image_lo, uint64_t image_hi)
+{
+  constexpr uint64_t candidates64[] = {0x00007ffd00000000ull, 0x0000600000000000ull,
+                                       0x0000000120000000ull};
+  constexpr uint64_t candidates32[] = {0x70000000ull, 0x50000000ull, 0x10000000ull};
+  const uint64_t *candidates = is64 ? candidates64 : candidates32;
+  for (size_t i = 0; i < 3; ++i)
+  {
+    const uint64_t base = candidates[i];
+    if (!(image_hi > image_lo && base < image_hi && image_lo < base + kViyScratchStackSize))
+      return base;
+  }
+  return 0;
+}
+
 // A taken control transfer prev->to observed during emulation (to != the static
 // fall-through of prev). `from` is the transferring instruction.
 struct ExecEdge

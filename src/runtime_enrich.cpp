@@ -304,7 +304,7 @@ qstring runtime_string_comment(const StringGroup &group, const char *location)
 {
   qstring text;
   const std::string preview = runtime_core::escaped_preview(group.codepoints);
-  text.sprnt("viy: corroborated runtime %s %s string at %s 0x%a (%u runs): \"",
+  text.sprnt("viy: runtime %s %s string candidate at %s 0x%a (%u runs agree on bytes): \"",
              runtime_core::encoding_name(group.key.encoding),
              runtime_core::layout_name(group.key.layout), location,
              (ea_t)group.key.addr,
@@ -324,6 +324,14 @@ void apply_runtime_strings(const ProgramImage &img, const EmuEvents &events,
   scan_options.image_big_endian = img.big_endian;
   scan_options.allow_unicode = cfg.want_unicode_strings;
   scan_options.allow_length_prefixed = true;
+  const bool is64 = img.arch == ViyArch::X86_64 || img.arch == ViyArch::ARM64
+                 || img.arch == ViyArch::RISCV64;
+  scan_options.pointer_width = is64 ? 8 : 4;
+  for (const SegImage &segment : img.segs)
+    scan_options.pointer_ranges.emplace_back(segment.start, segment.end);
+  const uint64_t scratch = viy_scratch_stack_base(is64, img.lo, img.hi);
+  if (scratch != 0)
+    scan_options.pointer_ranges.emplace_back(scratch, scratch + kViyScratchStackSize);
   const runtime_core::StringCollection collection =
     runtime_core::collect_string_groups(events.final_writes, scan_options);
   stats.string_observations = collection.observations;

@@ -275,7 +275,10 @@ final dirty ranges and can:
 - recognize NUL-terminated and bounded Pascal8/Pascal16/Pascal32 ASCII,
   strict UTF-8, UTF-16LE/BE, and UTF-32LE/BE strings with at least four decoded
   characters; multi-byte length prefixes follow target byte order and count
-  encoded code units;
+  encoded code units. Automatic recognition excludes private-use and
+  noncharacter scalars, and candidates overlapping aligned pointers into
+  mapped image or emulator scratch memory. Agreement across runs establishes
+  byte stability, not proof that the bytes represent text;
 
 - create a string only in undefined non-executable image data whose bytes are
   already present or were safely patched; stack, heap, executable, or

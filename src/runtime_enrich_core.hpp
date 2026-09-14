@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "emu_driver.hpp"
@@ -163,6 +164,10 @@ struct StringScanOptions
   size_t minimum_characters = kDefaultMinimumStringChars;
   size_t max_candidate_bytes = kDefaultMaxRuntimeStringBytes;
   size_t max_candidates_per_write = kDefaultMaxStringCandidatesPerWrite;
+  size_t pointer_width = 8;
+  // Known mapped image and emulator ranges [start,end). Candidates overlapping
+  // aligned words pointing into these ranges are ambiguous binary data.
+  std::vector<std::pair<uint64_t, uint64_t>> pointer_ranges;
 };
 
 struct StringCollection

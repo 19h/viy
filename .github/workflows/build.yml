@@ -115,12 +115,16 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             build/rax-capi/cargo
-          key: cargo-v1-${{ matrix.target }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vendor/rax/Cargo.lock', 'CMakeLists.txt', '.github/workflows/build.yml') }}-${{ github.sha }}
+          # Cargo recreates unpacked sources from the archives. Do not restore
+          # registry/src: an incomplete extraction can retain its completion
+          # marker and then fail with E0583 for missing windows-sys modules.
+          key: cargo-v2-${{ matrix.target }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vendor/rax/Cargo.lock', 'CMakeLists.txt', '.github/workflows/build.yml') }}-${{ github.sha }}
           restore-keys: |
-            cargo-v1-${{ matrix.target }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vendor/rax/Cargo.lock', 'CMakeLists.txt', '.github/workflows/build.yml') }}-
+            cargo-v2-${{ matrix.target }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('vendor/rax/Cargo.lock', 'CMakeLists.txt', '.github/workflows/build.yml') }}-
 
       - name: Restore C++ cache
         id: ccache
@@ -164,17 +168,19 @@ jobs:
           }
 
       - name: Build
+        id: build
         run: cmake --build build --config Release --parallel 3
 
       # Separate save steps retain successful compilation work even if tests fail.
       - name: Save Cargo build cache
-        if: always() && steps.cargo_cache.outputs.cache-primary-key != '' && steps.cargo_cache.outputs.cache-hit != 'true'
+        if: always() && steps.build.outcome == 'success' && steps.cargo_cache.outputs.cache-primary-key != '' && steps.cargo_cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
             build/rax-capi/cargo
           key: ${{ steps.cargo_cache.outputs.cache-primary-key }}
 
